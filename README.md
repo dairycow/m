@@ -36,6 +36,10 @@ startup number is a 100-run median of `m --version`.
   MTP draft-acceptance %, cached tokens. No other harness shows these.
 - **Sessions** are append-only JSONL under `~/.local/share/m/sessions/`,
   resumable (`m -r`, `ctrl+r` picker), faithful even across crashes.
+- **Small-model armor**, tuned on real SWE-bench trajectories: runaway
+  responses are discarded and retried with a corrective nudge instead of
+  poisoning the context, and a loop breaker intercepts the third identical
+  tool call so the agent steps back instead of spinning.
 - **YOLO by default**, like pi. You are the permission system.
 
 ## Usage
@@ -121,7 +125,11 @@ bench/.venv/bin/python -m swebench.harness.run_evaluation \
 ```
 
 The instance list is a deterministic stratified slice (all 300 Lite ids
-sorted, every 10th) — reproducible by anyone.
+sorted, every 10th) — reproducible by anyone. To keep scaffold tuning
+honest, that slice is treated as the *dev set* (its trajectories get mined
+for generic failure modes) while `m-bench pick -n 30 --offset 5` yields a
+disjoint *held-out* slice on which changes are actually judged. Only
+behavioral fixes are allowed — nothing instance- or repo-specific.
 
 ## Build
 
@@ -135,3 +143,11 @@ context/skills — no UI deps), `crates/m-tui` (the `m` binary: TUI +
 headless modes), `crates/m-bench` (SWE-bench runner). TLS is a cargo
 feature; the musl bench build disables it (containers only talk plain
 http to localhost) so the static binary needs no C toolchain at all.
+
+## Development
+
+Architecture, the invariants behind the speed (socket ownership,
+prompt-cache discipline, faithful session logs), how to add tools or slash
+commands, the bench anti-overfitting protocol, and the release checklist
+live in [DEVELOPMENT.md](DEVELOPMENT.md) — including how to hack on m
+using m itself.
