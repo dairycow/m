@@ -133,9 +133,11 @@ fn load_dataset(path: &str) -> Result<Vec<Instance>, String> {
 // ------------------------------------------------------------------ pick
 
 /// Deterministic stratified slice: sort all instance ids, take every
-/// (300/n)-th. Reproducible by anyone from the public dataset.
+/// (300/n)-th starting at --offset. Reproducible by anyone from the public
+/// dataset; different offsets give disjoint slices (dev vs held-out).
 fn cmd_pick(args: &[String]) -> i32 {
     let n: usize = flag(args, "-n").and_then(|s| s.parse().ok()).unwrap_or(30);
+    let offset: usize = flag(args, "--offset").and_then(|s| s.parse().ok()).unwrap_or(0);
     let dataset = flag(args, "--dataset").unwrap_or_else(|| "bench/dataset.json".into());
     let rows = match load_dataset(&dataset) {
         Ok(r) => r,
@@ -148,7 +150,7 @@ fn cmd_pick(args: &[String]) -> i32 {
     ids.sort();
     let step = (ids.len().max(1)) as f64 / n as f64;
     let mut picked = Vec::new();
-    let mut x = 0.0f64;
+    let mut x = offset as f64;
     while picked.len() < n && (x as usize) < ids.len() {
         picked.push(ids[x as usize]);
         x += step;
@@ -362,12 +364,36 @@ fn run_instance(cfg: &RunCfg, inst: &Instance) -> Result<Value, String> {
             }
         }
 
-        let patch = sh(
-            &format!("docker exec -w /testbed {cname} git diff"),
-            Duration::from_secs(120),
-        )
-        .unwrap_or_default();
-        let patch = if patch.starts_with("(no output") { String::new() } else { patch };
+        let read_patch = |cname: &str| -> String {
+            let p = sh(
+                &format!("docker exec -w /testbed {cname} git diff"),
+                Duration::from_secs(120),
+            )
+            .unwrap_or_default();
+            if p.starts_with("(no output") { String::new() } else { p }
+        };
+        let mut patch = read_patch(&cname);
+
+        // "You changed nothing" guard: the agent finished cleanly but made
+        // no modification — give it one short resumed pass to actually fix.
+        let mut retried = false;
+        if patch.is_empty() && exit == 0 {
+            retried = true;
+            let nudge = "You finished without modifying any files, so nothing was fixed. \
+                         Re-check your analysis, apply the fix to the library source with the \
+                         edit or write tool, and verify it before finishing.";
+            let retry_exec = format!(
+                "docker exec -e PATH=/opt/miniconda3/envs/testbed/bin:/opt/miniconda3/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+                 -e HOME=/root -w /testbed {cname} \
+                 sh -c 'm -p --json -r --max-turns 15 --max-tokens 4096 --temp 0 \"{nudge}\" >>/tmp/m-traj.jsonl 2>&1; echo M_EXIT:$?'"
+            );
+            let _ = sh(&retry_exec, Duration::from_secs(cfg.timeout.min(600)));
+            let _ = sh(
+                &format!("docker cp {cname}:/tmp/m-traj.jsonl {}", traj_path.display()),
+                Duration::from_secs(60),
+            );
+            patch = read_patch(&cname);
+        }
 
         // predictions.jsonl (official schema), appended atomically per instance.
         let pred = json!({
@@ -394,6 +420,7 @@ fn run_instance(cfg: &RunCfg, inst: &Instance) -> Result<Value, String> {
             "completion_tokens": completion_tokens,
             "mean_tok_per_sec": (mean_tps * 10.0).round() / 10.0,
             "agent_exit": exit,
+            "empty_diff_retry": retried,
             "patch_bytes": patch.len(),
         }))
     })();
