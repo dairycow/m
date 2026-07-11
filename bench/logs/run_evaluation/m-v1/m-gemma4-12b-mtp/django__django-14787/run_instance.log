@@ -1,0 +1,46 @@
+2026-07-12 06:42:42,667 - INFO - Creating container for django__django-14787...
+2026-07-12 06:42:42,835 - INFO - Container for django__django-14787 created: f12b28e9cedaff982999d5a5ea69802bea6738eddab5db5b7680b5cfc29d7c33
+2026-07-12 06:42:42,960 - INFO - Container for django__django-14787 started: f12b28e9cedaff982999d5a5ea69802bea6738eddab5db5b7680b5cfc29d7c33
+2026-07-12 06:42:42,960 - INFO - Intermediate patch for django__django-14787 written to logs/run_evaluation/m-v1/m-gemma4-12b-mtp/django__django-14787/patch.diff, now applying to container...
+2026-07-12 06:42:42,995 - INFO - Failed to apply patch to container: git apply --verbose
+2026-07-12 06:42:43,011 - INFO - Failed to apply patch to container: git apply --verbose --reject
+2026-07-12 06:42:43,030 - INFO - >>>>> Applied Patch:
+patching file django/utils/decorators.py
+
+2026-07-12 06:42:43,556 - INFO - Git diff before:
+diff --git a/django/utils/decorators.py b/django/utils/decorators.py
+index 5c9a5d01c7..07077d0fbb 100644
+--- a/django/utils/decorators.py
++++ b/django/utils/decorators.py
+@@ -81,8 +81,8 @@ def method_decorator(decorator, name=''):
+     if not hasattr(decorator, '__iter__'):
+         update_wrapper(_dec, decorator)
+     # Change the name to aid debugging.
+-    obj = decorator if hasattr(decorator, '__name__') else decorator.__class__
+-    _dec.__name__ = 'method_decorator(%s)' % obj.__name__
++    obj = decorator if hasattr(decorator, '__name__') else (getattr(decorator, '__class__', None) or decorator)
++    _dec.__name__ = 'method_decorator(%s)' % getattr(obj, '__name__', str(obj))
+     return _dec
+2026-07-12 06:42:43,556 - INFO - Eval script for django__django-14787 written to logs/run_evaluation/m-v1/m-gemma4-12b-mtp/django__django-14787/eval.sh; copying to container...
+2026-07-12 06:43:00,129 - INFO - Test runtime: 16.56 seconds
+2026-07-12 06:43:00,129 - INFO - Test output for django__django-14787 written to logs/run_evaluation/m-v1/m-gemma4-12b-mtp/django__django-14787/test_output.txt
+2026-07-12 06:43:00,148 - INFO - Git diff after:
+diff --git a/django/utils/decorators.py b/django/utils/decorators.py
+index 5c9a5d01c7..07077d0fbb 100644
+--- a/django/utils/decorators.py
++++ b/django/utils/decorators.py
+@@ -81,8 +81,8 @@ def method_decorator(decorator, name=''):
+     if not hasattr(decorator, '__iter__'):
+         update_wrapper(_dec, decorator)
+     # Change the name to aid debugging.
+-    obj = decorator if hasattr(decorator, '__name__') else decorator.__class__
+-    _dec.__name__ = 'method_decorator(%s)' % obj.__name__
++    obj = decorator if hasattr(decorator, '__name__') else (getattr(decorator, '__class__', None) or decorator)
++    _dec.__name__ = 'method_decorator(%s)' % getattr(obj, '__name__', str(obj))
+     return _dec
+2026-07-12 06:43:00,148 - INFO - Grading answer for django__django-14787...
+2026-07-12 06:43:00,148 - INFO - report: {'django__django-14787': {'patch_is_None': False, 'patch_exists': True, 'patch_successfully_applied': True, 'resolved': False, 'tests_status': {'FAIL_TO_PASS': {'success': [], 'failure': ['@method_decorator preserves wrapper assignments.']}, 'PASS_TO_PASS': {'success': ['test_cache_control_decorator_http_request (decorators.tests.CacheControlDecoratorTest)', 'Ensures @xframe_options_deny properly sets the X-Frame-Options header.', 'Ensures @xframe_options_exempt properly instructs the', 'Ensures @xframe_options_sameorigin properly sets the X-Frame-Options', 'Built-in decorators set certain attributes of the wrapped function.', 'test_cache_page (decorators.tests.DecoratorsTest)', 'Test for the require_safe decorator.', 'The user_passes_test decorator can be applied multiple times (#9474).', 'test_never_cache_decorator (decorators.tests.NeverCacheDecoratorTest)', 'test_never_cache_decorator_http_request (decorators.tests.NeverCacheDecoratorTest)', 'test_argumented (decorators.tests.MethodDecoratorTests)', 'test_bad_iterable (decorators.tests.MethodDecoratorTests)', '@method_decorator can be used to decorate a class and its methods.', 'test_descriptors (decorators.tests.MethodDecoratorTests)', '@method_decorator on a nonexistent method raises an error.', '@method_decorator on a non-callable attribute raises an error.', 'A decorator that sets a new attribute on the method.', 'test_preserve_attributes (decorators.tests.MethodDecoratorTests)', 'test_preserve_signature (decorators.tests.MethodDecoratorTests)', '@method_decorator can accept a tuple of decorators.'], 'failure': []}, 'FAIL_TO_FAIL': {'success': [], 'failure': []}, 'PASS_TO_FAIL': {'success': [], 'failure': []}}}}
+Result for django__django-14787: resolved: False
+2026-07-12 06:43:00,148 - INFO - Attempting to stop container sweb.eval.django__django-14787.m-v1...
+2026-07-12 06:43:15,253 - INFO - Attempting to remove container sweb.eval.django__django-14787.m-v1...
+2026-07-12 06:43:15,274 - INFO - Container sweb.eval.django__django-14787.m-v1 removed.
