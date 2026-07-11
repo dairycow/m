@@ -196,9 +196,13 @@ impl Agent {
     }
 
     fn run_loop(&mut self, on_event: &mut dyn FnMut(AgentEvent)) -> Result<RunOutcome> {
-        const MAX_LENGTH_NUDGES: usize = 3;
+        const MAX_LENGTH_NUDGES: usize = 5;
         let mut turns = 0usize;
         let mut nudges = 0usize;
+        // Repeated identical tool calls: signature → (executions, last output
+        // hash). Cleared whenever a write/edit succeeds (state changed, so a
+        // rerun is legitimate again).
+        let mut seen: std::collections::HashMap<u64, (u32, u64)> = Default::default();
         loop {
             if self.cancel.load(Ordering::Relaxed) {
                 return Ok(RunOutcome { stop: StopReason::Cancelled, final_text: String::new(), turns });
@@ -229,27 +233,28 @@ impl Agent {
                 timings: completion.timings.clone(),
             });
 
-            self.session.push(completion.msg.clone())?;
             turns += 1;
 
             let tool_calls = completion.msg.tool_calls.clone().unwrap_or_default();
             if tool_calls.is_empty() {
                 if completion.finish_reason == "length" {
                     // Truncated mid-thought (usually a reasoning runaway on
-                    // small models). Nudge it back on track a few times
-                    // before giving up.
+                    // small models). Retry fresh: the truncated message is
+                    // NOT added to the context — resending the runaway text
+                    // reliably re-triggers the same loop — only the nudge is.
                     if nudges < MAX_LENGTH_NUDGES {
                         nudges += 1;
                         on_event(AgentEvent::Notice(format!(
-                            "response hit the token limit — nudging ({nudges}/{MAX_LENGTH_NUDGES})"
+                            "response hit the token limit — retrying ({nudges}/{MAX_LENGTH_NUDGES})"
                         )));
                         self.session.push(Msg::user(
-                            "(Your response was cut off at the token limit. Stop deliberating: \
-                             take the next concrete step with a single tool call, or give your \
-                             final answer in a few sentences.)",
+                            "(Your previous response overran the token limit and was discarded. \
+                             Do not repeat that reasoning. Take the next concrete step with a \
+                             single tool call, or give your final answer in a few sentences.)",
                         ))?;
                         continue;
                     }
+                    self.session.push(completion.msg.clone())?;
                     on_event(AgentEvent::Notice("response hit the token limit".into()));
                     return Ok(RunOutcome {
                         stop: StopReason::Length,
@@ -257,12 +262,14 @@ impl Agent {
                         turns,
                     });
                 }
+                self.session.push(completion.msg.clone())?;
                 return Ok(RunOutcome {
                     stop: StopReason::Done,
                     final_text: completion.msg.content.unwrap_or_default(),
                     turns,
                 });
             }
+            self.session.push(completion.msg.clone())?;
 
             for call in &tool_calls {
                 if self.cancel.load(Ordering::Relaxed) {
@@ -271,17 +278,57 @@ impl Agent {
                     self.session.push(Msg::tool_result(&call.id, "Cancelled by user."))?;
                     continue;
                 }
+                // Loop breaker: a third identical call with unchanged state
+                // is intercepted instead of executed.
+                let sig = Self::fnv(&call.function.name, &call.function.arguments);
+                if let Some(&(n, _)) = seen.get(&sig)
+                    && n >= 2
+                {
+                    on_event(AgentEvent::Notice(format!(
+                        "blocked repeated identical {} call",
+                        call.function.name
+                    )));
+                    self.session.push(Msg::tool_result(
+                        &call.id,
+                        "(Not executed: you have already run exactly this twice and nothing has \
+                         changed since. Repeating it will not help. Step back — re-read the \
+                         relevant source with the read tool, question your current hypothesis, \
+                         and take a different approach.)",
+                    ))?;
+                    continue;
+                }
                 on_event(AgentEvent::ToolStart {
                     name: call.function.name.clone(),
                     args: call.function.arguments.clone(),
                 });
-                let out = tools::execute(
+                let mut out = tools::execute(
                     &call.function.name,
                     &call.function.arguments,
                     &self.cwd,
                     &self.skills,
                     &self.cancel,
                 );
+                let out_hash = Self::fnv("", &out.content);
+                match seen.entry(sig) {
+                    std::collections::hash_map::Entry::Occupied(mut e) => {
+                        let (n, prev) = e.get_mut();
+                        *n += 1;
+                        if *prev == out_hash {
+                            out.content.push_str(
+                                "\n(note: identical output to the last time you ran exactly \
+                                 this — a different approach may be needed)",
+                            );
+                        }
+                        *prev = out_hash;
+                    }
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        e.insert((1, out_hash));
+                    }
+                }
+                // A successful mutation makes reruns legitimate again.
+                if !out.is_error && matches!(call.function.name.as_str(), "write" | "edit") {
+                    seen.clear();
+                }
                 on_event(AgentEvent::ToolEnd {
                     name: call.function.name.clone(),
                     output: out.content.clone(),
@@ -343,7 +390,16 @@ impl Agent {
         }
     }
 
-    /// When the conversation nears the context limit, clip old tool outputs
+    fn fnv(a: &str, b: &str) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for byte in a.bytes().chain([0u8]).chain(b.bytes()) {
+        h ^= byte as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// When the conversation nears the context limit, clip old tool outputs
     /// in memory. This costs the KV prefix cache once, but keeps long runs
     /// alive.
     fn guard_context(&mut self, on_event: &mut dyn FnMut(AgentEvent)) {
