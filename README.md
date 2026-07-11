@@ -7,6 +7,20 @@ performance envelope of [jcode](https://github.com/1jehuang/jcode)
 **Gemma 4 12B + MTP** llama-server in this repo ([SERVER.md](SERVER.md),
 [RUNSHEET.md](RUNSHEET.md)) — but any OpenAI-compatible endpoint works.
 
+## Thesis
+
+**With just a bash tool, a capable model can do anything on a computer.**
+That is the whole point of this project. Reading, searching, building,
+testing, git, deploys, diagrams — to a model that already knows the
+coding-agent pattern, they are all just commands. So the harness earns its
+keep not by accumulating features but by getting out of the way: deliver
+tokens and keystrokes as fast as physically possible, keep the prompt
+cacheable, spend almost none of the model's context on itself. `read`,
+`write`, and `edit` are ergonomic sugar over what bash could do alone;
+everything else is files (AGENTS.md, skills, commands) teaching the model
+what this machine can do. When a capability seems missing, the answer is
+a skill that documents a CLI — not a feature in core.
+
 ## Measured (this machine, RTX 4070 Ti SUPER)
 
 | metric | m | reference |
