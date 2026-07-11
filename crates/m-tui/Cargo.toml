@@ -1,0 +1,23 @@
+[package]
+name = "m-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "m"
+path = "src/main.rs"
+
+[features]
+default = ["tls"]
+tls = ["m-core/tls"]
+
+[dependencies]
+m-core = { path = "../m-core", default-features = false }
+serde_json.workspace = true
+libc.workspace = true
+ratatui = "0.29"
+crossterm = "0.28"
+pulldown-cmark = { version = "0.12", default-features = false }
+syntect = { version = "5", default-features = false, features = ["default-fancy"] }
+unicode-width = "0.2"

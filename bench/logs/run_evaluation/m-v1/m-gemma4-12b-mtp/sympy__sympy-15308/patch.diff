@@ -1,0 +1,16 @@
+diff --git a/sympy/printing/latex.py b/sympy/printing/latex.py
+index a0eb97792e..07f70ffe94 100644
+--- a/sympy/printing/latex.py
++++ b/sympy/printing/latex.py
+@@ -1462,7 +1462,11 @@ def _print_Transpose(self, expr):
+         else:
+             return "%s^T" % self._print(mat)
+ 
++    def _print_Trace(self, expr):
++        return r"\mathrm{Trace}\left(%s\right)" % self._print(expr.arg)
++
+     def _print_Adjoint(self, expr):
++
+         mat = expr.arg
+         from sympy.matrices import MatrixSymbol
+         if not isinstance(mat, MatrixSymbol):
