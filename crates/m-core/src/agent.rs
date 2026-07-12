@@ -10,7 +10,7 @@ use std::time::Duration;
 use crate::config::Config;
 use crate::context::SkillInfo;
 use crate::error::{Error, Result};
-use crate::provider::{self, Delta, Msg, Timings, ToolSpec, Usage};
+use crate::provider::{self, ChatProvider, Delta, Msg, Timings, ToolSpec, Usage};
 use crate::session::Session;
 use crate::tools;
 
@@ -63,6 +63,9 @@ pub struct Agent {
     system_prompt: String,
     skills: Vec<SkillInfo>,
     tools: Vec<ToolSpec>,
+    /// The chat endpoint. HTTP in production; tests inject scripted
+    /// completions here to exercise the loop without a server.
+    provider: Box<dyn ChatProvider>,
     /// Context size, possibly updated by a background /props probe.
     ctx_limit: Arc<AtomicUsize>,
     last_prompt_tokens: u64,
@@ -117,9 +120,15 @@ impl Agent {
             system_prompt,
             tools: tools::specs(!skills.is_empty()),
             skills,
+            provider: Box::new(provider::Http),
             ctx_limit,
             last_prompt_tokens: 0,
         }
+    }
+
+    /// Replace the chat provider (tests, alternative transports).
+    pub fn set_provider(&mut self, provider: Box<dyn ChatProvider>) {
+        self.provider = provider;
     }
 
     /// Context-limit handle (updated by the background /props probe).
@@ -155,13 +164,13 @@ impl Agent {
              and its current state, key decisions, relevant file paths and their roles, and any \
              unfinished steps. Be concise but complete. Reply with only the summary.",
         ));
-        let completion = provider::stream_chat(
+        let completion = self.provider.stream_chat(
             &self.config.profile,
             &wire,
             &[],
             self.config.profile.temperature,
             Arc::clone(&self.cancel),
-            |d| {
+            &mut |d| {
                 if let Delta::Content(s) = d {
                     on_event(AgentEvent::Content(s));
                 }
@@ -359,13 +368,13 @@ impl Agent {
         }
         let mut attempt = 0;
         loop {
-            let result = provider::stream_chat(
+            let result = self.provider.stream_chat(
                 &self.config.profile,
                 wire,
                 &self.tools,
                 self.config.profile.temperature,
                 Arc::clone(&self.cancel),
-                |d| forward(d, on_event),
+                &mut |d| forward(d, on_event),
             );
             match result {
                 Err(Error::Msg(m)) if attempt == 0 && !m.starts_with("API error") => {
@@ -379,15 +388,15 @@ impl Agent {
     }
 
     fn fnv(a: &str, b: &str) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for byte in a.bytes().chain([0u8]).chain(b.bytes()) {
-        h ^= byte as u64;
-        h = h.wrapping_mul(0x100000001b3);
+        let mut h: u64 = 0xcbf29ce484222325;
+        for byte in a.bytes().chain([0u8]).chain(b.bytes()) {
+            h ^= byte as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        h
     }
-    h
-}
 
-/// When the conversation nears the context limit, clip old tool outputs
+    /// When the conversation nears the context limit, clip old tool outputs
     /// in memory. This costs the KV prefix cache once, but keeps long runs
     /// alive.
     fn guard_context(&mut self, on_event: &mut dyn FnMut(AgentEvent)) {
@@ -418,5 +427,293 @@ impl Agent {
             // Force re-measure on the next response.
             self.last_prompt_tokens = 0;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provider::{Completion, FunctionCall, ToolCall};
+    use std::sync::atomic::AtomicUsize;
+
+    /// Scripted provider: pops one pre-baked completion per request and
+    /// records every wire it was sent, so tests can assert on exactly what
+    /// the model would have seen.
+    struct Scripted {
+        replies: Mutex<VecDeque<Result<Completion>>>,
+        wires: Arc<Mutex<Vec<Vec<Msg>>>>,
+        /// Set the cancel flag while serving this (1-based) request.
+        cancel_on_call: Option<usize>,
+    }
+
+    impl ChatProvider for Scripted {
+        fn stream_chat(
+            &self,
+            _profile: &crate::config::Profile,
+            messages: &[Msg],
+            _tools: &[ToolSpec],
+            _temperature: Option<f32>,
+            cancel: Arc<AtomicBool>,
+            _on_delta: &mut dyn FnMut(Delta),
+        ) -> Result<Completion> {
+            let mut wires = self.wires.lock().unwrap();
+            wires.push(messages.to_vec());
+            if self.cancel_on_call == Some(wires.len()) {
+                cancel.store(true, Ordering::SeqCst);
+            }
+            self.replies
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| Err(Error::msg("test script exhausted")))
+        }
+    }
+
+    fn completion(msg: Msg, finish_reason: &str) -> Completion {
+        Completion { msg, finish_reason: finish_reason.into(), usage: None, timings: None }
+    }
+
+    fn done(text: &str) -> Result<Completion> {
+        Ok(completion(
+            Msg { role: "assistant".into(), content: Some(text.into()), tool_calls: None, tool_call_id: None, reasoning: None },
+            "stop",
+        ))
+    }
+
+    fn length(text: &str) -> Result<Completion> {
+        Ok(completion(
+            Msg { role: "assistant".into(), content: Some(text.into()), tool_calls: None, tool_call_id: None, reasoning: None },
+            "length",
+        ))
+    }
+
+    fn tool_calls(calls: &[(&str, &str)]) -> Result<Completion> {
+        let tc = calls
+            .iter()
+            .enumerate()
+            .map(|(i, (name, args))| ToolCall {
+                id: format!("call_{i}"),
+                kind: "function".into(),
+                function: FunctionCall { name: (*name).into(), arguments: (*args).into() },
+            })
+            .collect();
+        Ok(completion(
+            Msg { role: "assistant".into(), content: None, tool_calls: Some(tc), tool_call_id: None, reasoning: None },
+            "tool_calls",
+        ))
+    }
+
+    fn with_usage(c: Result<Completion>, prompt_tokens: u64) -> Result<Completion> {
+        c.map(|mut c| {
+            c.usage = Some(Usage { prompt_tokens, completion_tokens: 0, total_tokens: prompt_tokens });
+            c
+        })
+    }
+
+    /// Agent in a unique temp cwd with a scripted provider; the dead
+    /// base_url makes the background /props probe fail instantly.
+    fn scripted_agent(
+        replies: Vec<Result<Completion>>,
+        cancel_on_call: Option<usize>,
+    ) -> (Agent, Arc<Mutex<Vec<Vec<Msg>>>>) {
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "m-agent-test-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut config = Config::default();
+        config.profile.base_url = "http://127.0.0.1:1".into();
+        let mut agent = Agent::new(config, dir, "test system prompt".into(), Vec::new()).unwrap();
+        let wires = Arc::new(Mutex::new(Vec::new()));
+        agent.set_provider(Box::new(Scripted {
+            replies: Mutex::new(replies.into()),
+            wires: Arc::clone(&wires),
+            cancel_on_call,
+        }));
+        (agent, wires)
+    }
+
+    fn run(agent: &mut Agent, prompt: &str) -> (RunOutcome, Vec<AgentEvent>) {
+        let mut events = Vec::new();
+        let outcome = agent.run_prompt(prompt, &mut |e| events.push(e)).unwrap();
+        (outcome, events)
+    }
+
+    fn tool_results(agent: &Agent) -> Vec<String> {
+        agent
+            .session
+            .messages
+            .iter()
+            .filter(|m| m.role == "tool")
+            .filter_map(|m| m.content.clone())
+            .collect()
+    }
+
+    #[test]
+    fn final_answer_without_tools() {
+        let (mut agent, wires) = scripted_agent(vec![done("all done")], None);
+        let (outcome, _) = run(&mut agent, "hi");
+        assert_eq!(outcome.stop, StopReason::Done);
+        assert_eq!(outcome.final_text, "all done");
+        assert_eq!(outcome.turns, 1);
+        // Wire = system prompt + user prompt.
+        let wire = &wires.lock().unwrap()[0];
+        assert_eq!(wire[0].role, "system");
+        assert_eq!(wire.last().unwrap().content.as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn length_runaway_is_discarded_and_nudged() {
+        let (mut agent, wires) = scripted_agent(vec![length("RUNAWAY reasoning"), done("ok")], None);
+        let (outcome, _) = run(&mut agent, "go");
+        assert_eq!(outcome.stop, StopReason::Done);
+        // The retry wire carries the corrective nudge but not the runaway text.
+        let retry_wire = &wires.lock().unwrap()[1];
+        let flat: String =
+            retry_wire.iter().filter_map(|m| m.content.clone()).collect::<Vec<_>>().join("\n");
+        assert!(flat.contains("overran the token limit"));
+        assert!(!flat.contains("RUNAWAY"));
+    }
+
+    #[test]
+    fn length_nudges_exhaust_to_length_stop() {
+        let replies = (0..6).map(|_| length("x")).collect();
+        let (mut agent, _) = scripted_agent(replies, None);
+        let (outcome, _) = run(&mut agent, "go");
+        assert_eq!(outcome.stop, StopReason::Length);
+        assert_eq!(outcome.turns, 6);
+        let nudges = agent
+            .session
+            .messages
+            .iter()
+            .filter(|m| {
+                m.role == "user"
+                    && m.content.as_deref().is_some_and(|c| c.contains("overran the token limit"))
+            })
+            .count();
+        assert_eq!(nudges, 5);
+        // The final truncated answer is kept.
+        assert_eq!(agent.session.messages.last().unwrap().content.as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn repeated_identical_call_gets_escalating_note() {
+        let echo = ("bash", r#"{"command":"echo stable"}"#);
+        let (mut agent, _) =
+            scripted_agent(vec![tool_calls(&[echo]), tool_calls(&[echo]), done("ok")], None);
+        let (outcome, _) = run(&mut agent, "go");
+        assert_eq!(outcome.stop, StopReason::Done);
+        let results = tool_results(&agent);
+        assert_eq!(results.len(), 2);
+        assert!(!results[0].contains("(note:"));
+        assert!(results[1].contains("run exactly this 2 times"));
+    }
+
+    #[test]
+    fn successful_write_clears_repeat_tracking() {
+        let echo = ("bash", r#"{"command":"echo stable"}"#);
+        let write = ("write", r#"{"path":"f.txt","content":"x"}"#);
+        let (mut agent, _) = scripted_agent(
+            vec![tool_calls(&[echo]), tool_calls(&[write]), tool_calls(&[echo]), done("ok")],
+            None,
+        );
+        let (outcome, _) = run(&mut agent, "go");
+        assert_eq!(outcome.stop, StopReason::Done);
+        let results = tool_results(&agent);
+        assert_eq!(results.len(), 3);
+        // The rerun after a state change is not annotated.
+        assert!(!results[2].contains("(note:"), "got: {}", results[2]);
+    }
+
+    #[test]
+    fn cancel_mid_turn_still_answers_every_tool_call() {
+        let echo = ("bash", r#"{"command":"echo hi"}"#);
+        let (mut agent, _) =
+            scripted_agent(vec![tool_calls(&[echo, echo])], Some(1));
+        let (outcome, _) = run(&mut agent, "go");
+        assert_eq!(outcome.stop, StopReason::Cancelled);
+        let results = tool_results(&agent);
+        assert_eq!(results, vec!["Cancelled by user.", "Cancelled by user."]);
+    }
+
+    #[test]
+    fn max_turns_stops_the_loop() {
+        let echo = ("bash", r#"{"command":"echo hi"}"#);
+        let (mut agent, _) =
+            scripted_agent(vec![tool_calls(&[echo]), tool_calls(&[echo])], None);
+        agent.config.max_turns = 2;
+        let (outcome, _) = run(&mut agent, "go");
+        assert_eq!(outcome.stop, StopReason::MaxTurns);
+        assert_eq!(outcome.turns, 2);
+    }
+
+    #[test]
+    fn steering_input_is_injected_after_tools() {
+        let echo = ("bash", r#"{"command":"echo hi"}"#);
+        let (mut agent, wires) = scripted_agent(vec![tool_calls(&[echo]), done("ok")], None);
+        agent.steer.lock().unwrap().push_back("also check the docs".into());
+        let (outcome, _) = run(&mut agent, "go");
+        assert_eq!(outcome.stop, StopReason::Done);
+        let retry_wire = &wires.lock().unwrap()[1];
+        assert!(
+            retry_wire
+                .iter()
+                .any(|m| m.role == "user" && m.content.as_deref() == Some("also check the docs"))
+        );
+    }
+
+    #[test]
+    fn transport_error_is_retried_once() {
+        let (mut agent, wires) =
+            scripted_agent(vec![Err(Error::msg("connection reset")), done("ok")], None);
+        let (outcome, _) = run(&mut agent, "go");
+        assert_eq!(outcome.stop, StopReason::Done);
+        assert_eq!(wires.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn api_error_is_not_retried() {
+        let (mut agent, wires) =
+            scripted_agent(vec![Err(Error::msg("API error (HTTP 400): bad request"))], None);
+        let err = agent.run_prompt("go", &mut |_| {}).unwrap_err();
+        assert!(err.to_string().contains("API error"));
+        assert_eq!(wires.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn context_guard_clips_memory_not_session_file() {
+        let echo = ("bash", r#"{"command":"echo hi"}"#);
+        let (mut agent, _) = scripted_agent(
+            vec![with_usage(tool_calls(&[echo]), 900), done("ok")],
+            None,
+        );
+        agent.ctx_limit_handle().store(1000, Ordering::Relaxed);
+        let long = "y".repeat(700);
+        for i in 0..12 {
+            agent.session.push(Msg::tool_result(&format!("old_{i}"), &long)).unwrap();
+        }
+        let (outcome, events) = run(&mut agent, "go");
+        assert_eq!(outcome.stop, StopReason::Done);
+        assert!(events.iter().any(
+            |e| matches!(e, AgentEvent::Notice(n) if n.contains("clipped"))
+        ));
+        let clipped_in_memory = agent
+            .session
+            .messages
+            .iter()
+            .filter(|m| m.content.as_deref().is_some_and(|c| c.contains("clipped to fit context")))
+            .count();
+        assert!(clipped_in_memory > 0);
+        // The session file stays faithful.
+        let reloaded = Session::load(&agent.session.path).unwrap();
+        assert!(
+            reloaded
+                .messages
+                .iter()
+                .all(|m| !m.content.as_deref().unwrap_or("").contains("clipped to fit context"))
+        );
+        assert!(reloaded.messages.iter().any(|m| m.content.as_deref() == Some(long.as_str())));
     }
 }
