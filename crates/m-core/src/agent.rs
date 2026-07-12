@@ -52,6 +52,11 @@ pub struct RunOutcome {
 const CTX_GUARD_FRACTION: f64 = 0.85;
 /// Never clip messages within this many of the end.
 const CTX_GUARD_KEEP_TAIL: usize = 8;
+/// Minimum sampling temperature for the one request after a recovery event
+/// (length nudge or annotated identical repeat). At temp 0 a loop is a
+/// fixed point — the same context reproduces the same runaway; resampling
+/// is the way out. Applied only when the configured temperature is lower.
+const RECOVERY_TEMP: f32 = 0.4;
 
 pub struct Agent {
     pub config: Config,
@@ -212,6 +217,9 @@ impl Agent {
         // hash). Cleared whenever a write/edit succeeds (state changed, so a
         // rerun is legitimate again).
         let mut seen: std::collections::HashMap<u64, (u32, u64)> = Default::default();
+        // Set when the previous turn hit a recovery event; bumps the next
+        // request's temperature once (see RECOVERY_TEMP).
+        let mut recovery = false;
         loop {
             if self.cancel.load(Ordering::Relaxed) {
                 return Ok(RunOutcome { stop: StopReason::Cancelled, final_text: String::new(), turns });
@@ -222,7 +230,19 @@ impl Agent {
             wire.push(Msg::system(&self.system_prompt));
             wire.extend(self.session.messages.iter().cloned());
 
-            let completion = match self.stream_with_retry(&wire, on_event) {
+            let temperature = if std::mem::take(&mut recovery) {
+                let t = Self::recovery_temp(self.config.profile.temperature);
+                if t != self.config.profile.temperature {
+                    on_event(AgentEvent::Notice(format!(
+                        "recovery turn — temperature {RECOVERY_TEMP} for one request"
+                    )));
+                }
+                t
+            } else {
+                self.config.profile.temperature
+            };
+
+            let completion = match self.stream_with_retry(&wire, temperature, on_event) {
                 Ok(c) => c,
                 Err(Error::Cancelled) => {
                     return Ok(RunOutcome {
@@ -253,6 +273,7 @@ impl Agent {
                     // reliably re-triggers the same loop — only the nudge is.
                     if nudges < MAX_LENGTH_NUDGES {
                         nudges += 1;
+                        recovery = true;
                         on_event(AgentEvent::Notice(format!(
                             "response hit the token limit — retrying ({nudges}/{MAX_LENGTH_NUDGES})"
                         )));
@@ -310,6 +331,7 @@ impl Agent {
                         let (n, prev) = e.get_mut();
                         *n += 1;
                         if *prev == out_hash {
+                            recovery = true;
                             out.content.push_str(&format!(
                                 "\n(note: you have run exactly this {n} times now with \
                                  identical output — question the hypothesis that led here \
@@ -357,6 +379,7 @@ impl Agent {
     fn stream_with_retry(
         &self,
         wire: &[Msg],
+        temperature: Option<f32>,
         on_event: &mut dyn FnMut(AgentEvent),
     ) -> Result<provider::Completion> {
         fn forward(d: Delta, on_event: &mut dyn FnMut(AgentEvent)) {
@@ -372,7 +395,7 @@ impl Agent {
                 &self.config.profile,
                 wire,
                 &self.tools,
-                self.config.profile.temperature,
+                temperature,
                 Arc::clone(&self.cancel),
                 &mut |d| forward(d, on_event),
             );
@@ -384,6 +407,16 @@ impl Agent {
                 }
                 other => return other,
             }
+        }
+    }
+
+    /// The temperature for a recovery request: at least RECOVERY_TEMP when
+    /// an explicit lower temperature is configured; a server-default (None)
+    /// or already-hot temperature is left alone.
+    fn recovery_temp(configured: Option<f32>) -> Option<f32> {
+        match configured {
+            Some(t) if t < RECOVERY_TEMP => Some(RECOVERY_TEMP),
+            other => other,
         }
     }
 
@@ -442,9 +475,13 @@ mod tests {
     struct Scripted {
         replies: Mutex<VecDeque<Result<Completion>>>,
         wires: Arc<Mutex<Vec<Vec<Msg>>>>,
+        temps: Arc<Mutex<Vec<Option<f32>>>>,
         /// Set the cancel flag while serving this (1-based) request.
         cancel_on_call: Option<usize>,
     }
+
+    /// scriptable_agent return type: (agent, wire history, temperature history).
+    type ScriptedTuple = (Agent, Arc<Mutex<Vec<Vec<Msg>>>>, Arc<Mutex<Vec<Option<f32>>>>);
 
     impl ChatProvider for Scripted {
         fn stream_chat(
@@ -452,12 +489,13 @@ mod tests {
             _profile: &crate::config::Profile,
             messages: &[Msg],
             _tools: &[ToolSpec],
-            _temperature: Option<f32>,
+            temperature: Option<f32>,
             cancel: Arc<AtomicBool>,
             _on_delta: &mut dyn FnMut(Delta),
         ) -> Result<Completion> {
             let mut wires = self.wires.lock().unwrap();
             wires.push(messages.to_vec());
+            self.temps.lock().unwrap().push(temperature);
             if self.cancel_on_call == Some(wires.len()) {
                 cancel.store(true, Ordering::SeqCst);
             }
@@ -515,7 +553,7 @@ mod tests {
     fn scripted_agent(
         replies: Vec<Result<Completion>>,
         cancel_on_call: Option<usize>,
-    ) -> (Agent, Arc<Mutex<Vec<Vec<Msg>>>>) {
+    ) -> ScriptedTuple {
         static N: AtomicUsize = AtomicUsize::new(0);
         let dir = std::env::temp_dir().join(format!(
             "m-agent-test-{}-{}",
@@ -527,12 +565,14 @@ mod tests {
         config.profile.base_url = "http://127.0.0.1:1".into();
         let mut agent = Agent::new(config, dir, "test system prompt".into(), Vec::new()).unwrap();
         let wires = Arc::new(Mutex::new(Vec::new()));
+        let temps = Arc::new(Mutex::new(Vec::new()));
         agent.set_provider(Box::new(Scripted {
             replies: Mutex::new(replies.into()),
             wires: Arc::clone(&wires),
+            temps: Arc::clone(&temps),
             cancel_on_call,
         }));
-        (agent, wires)
+        (agent, wires, temps)
     }
 
     fn run(agent: &mut Agent, prompt: &str) -> (RunOutcome, Vec<AgentEvent>) {
@@ -553,7 +593,7 @@ mod tests {
 
     #[test]
     fn final_answer_without_tools() {
-        let (mut agent, wires) = scripted_agent(vec![done("all done")], None);
+        let (mut agent, wires, _) = scripted_agent(vec![done("all done")], None);
         let (outcome, _) = run(&mut agent, "hi");
         assert_eq!(outcome.stop, StopReason::Done);
         assert_eq!(outcome.final_text, "all done");
@@ -566,7 +606,7 @@ mod tests {
 
     #[test]
     fn length_runaway_is_discarded_and_nudged() {
-        let (mut agent, wires) = scripted_agent(vec![length("RUNAWAY reasoning"), done("ok")], None);
+        let (mut agent, wires, _) = scripted_agent(vec![length("RUNAWAY reasoning"), done("ok")], None);
         let (outcome, _) = run(&mut agent, "go");
         assert_eq!(outcome.stop, StopReason::Done);
         // The retry wire carries the corrective nudge but not the runaway text.
@@ -580,7 +620,7 @@ mod tests {
     #[test]
     fn length_nudges_exhaust_to_length_stop() {
         let replies = (0..6).map(|_| length("x")).collect();
-        let (mut agent, _) = scripted_agent(replies, None);
+        let (mut agent, _, _) = scripted_agent(replies, None);
         let (outcome, _) = run(&mut agent, "go");
         assert_eq!(outcome.stop, StopReason::Length);
         assert_eq!(outcome.turns, 6);
@@ -601,7 +641,7 @@ mod tests {
     #[test]
     fn repeated_identical_call_gets_escalating_note() {
         let echo = ("bash", r#"{"command":"echo stable"}"#);
-        let (mut agent, _) =
+        let (mut agent, _, _) =
             scripted_agent(vec![tool_calls(&[echo]), tool_calls(&[echo]), done("ok")], None);
         let (outcome, _) = run(&mut agent, "go");
         assert_eq!(outcome.stop, StopReason::Done);
@@ -615,7 +655,7 @@ mod tests {
     fn successful_write_clears_repeat_tracking() {
         let echo = ("bash", r#"{"command":"echo stable"}"#);
         let write = ("write", r#"{"path":"f.txt","content":"x"}"#);
-        let (mut agent, _) = scripted_agent(
+        let (mut agent, _, _) = scripted_agent(
             vec![tool_calls(&[echo]), tool_calls(&[write]), tool_calls(&[echo]), done("ok")],
             None,
         );
@@ -630,7 +670,7 @@ mod tests {
     #[test]
     fn cancel_mid_turn_still_answers_every_tool_call() {
         let echo = ("bash", r#"{"command":"echo hi"}"#);
-        let (mut agent, _) =
+        let (mut agent, _, _) =
             scripted_agent(vec![tool_calls(&[echo, echo])], Some(1));
         let (outcome, _) = run(&mut agent, "go");
         assert_eq!(outcome.stop, StopReason::Cancelled);
@@ -641,7 +681,7 @@ mod tests {
     #[test]
     fn max_turns_stops_the_loop() {
         let echo = ("bash", r#"{"command":"echo hi"}"#);
-        let (mut agent, _) =
+        let (mut agent, _, _) =
             scripted_agent(vec![tool_calls(&[echo]), tool_calls(&[echo])], None);
         agent.config.max_turns = 2;
         let (outcome, _) = run(&mut agent, "go");
@@ -652,7 +692,7 @@ mod tests {
     #[test]
     fn steering_input_is_injected_after_tools() {
         let echo = ("bash", r#"{"command":"echo hi"}"#);
-        let (mut agent, wires) = scripted_agent(vec![tool_calls(&[echo]), done("ok")], None);
+        let (mut agent, wires, _) = scripted_agent(vec![tool_calls(&[echo]), done("ok")], None);
         agent.steer.lock().unwrap().push_back("also check the docs".into());
         let (outcome, _) = run(&mut agent, "go");
         assert_eq!(outcome.stop, StopReason::Done);
@@ -666,7 +706,7 @@ mod tests {
 
     #[test]
     fn transport_error_is_retried_once() {
-        let (mut agent, wires) =
+        let (mut agent, wires, _) =
             scripted_agent(vec![Err(Error::msg("connection reset")), done("ok")], None);
         let (outcome, _) = run(&mut agent, "go");
         assert_eq!(outcome.stop, StopReason::Done);
@@ -675,7 +715,7 @@ mod tests {
 
     #[test]
     fn api_error_is_not_retried() {
-        let (mut agent, wires) =
+        let (mut agent, wires, _) =
             scripted_agent(vec![Err(Error::msg("API error (HTTP 400): bad request"))], None);
         let err = agent.run_prompt("go", &mut |_| {}).unwrap_err();
         assert!(err.to_string().contains("API error"));
@@ -685,7 +725,7 @@ mod tests {
     #[test]
     fn context_guard_clips_memory_not_session_file() {
         let echo = ("bash", r#"{"command":"echo hi"}"#);
-        let (mut agent, _) = scripted_agent(
+        let (mut agent, _, _) = scripted_agent(
             vec![with_usage(tool_calls(&[echo]), 900), done("ok")],
             None,
         );
@@ -715,5 +755,69 @@ mod tests {
                 .all(|m| !m.content.as_deref().unwrap_or("").contains("clipped to fit context"))
         );
         assert!(reloaded.messages.iter().any(|m| m.content.as_deref() == Some(long.as_str())));
+    }
+
+    #[test]
+    fn recovery_temp_applies_on_length_nudge() {
+        // A length-runaway should trigger temp 0.4 on the retry, then
+        // fall back to the configured 0.0 once the model answers cleanly.
+        let (mut agent, _, temps) = scripted_agent(vec![length("boom"), done("ok")], None);
+        agent.config.profile.temperature = Some(0.0);
+        let (outcome, _) = run(&mut agent, "go");
+        assert_eq!(outcome.stop, StopReason::Done);
+        let t: Vec<_> = temps.lock().unwrap().clone();
+        assert_eq!(t, vec![Some(0.0), Some(0.4)], "temps: {t:?}");
+    }
+
+    #[test]
+    fn recovery_temp_applies_on_identical_repeat() {
+        let echo = ("bash", r#"{"command":"echo hi"}"#);
+        // 3 identical tool calls with identical output → third triggers recovery
+        let (mut agent, _, temps) = scripted_agent(
+            vec![tool_calls(&[echo]), tool_calls(&[echo]), tool_calls(&[echo]), done("ok")],
+            None,
+        );
+        agent.config.profile.temperature = Some(0.0);
+        let (outcome, _) = run(&mut agent, "go");
+        assert_eq!(outcome.stop, StopReason::Done);
+        let t: Vec<_> = temps.lock().unwrap().clone();
+        // 4 calls to the model: normal, normal, annotated-repeat→recovery, recovery (final answer)
+        assert_eq!(t, vec![Some(0.0), Some(0.0), Some(0.4), Some(0.4)], "temps: {t:?}");
+    }
+
+    #[test]
+    fn recovery_temp_unchanged_when_already_hot() {
+        // When configured temp is already ≥ RECOVERY_TEMP, no change.
+        let (mut agent, _, temps) = scripted_agent(vec![length("boom"), done("ok")], None);
+        agent.config.profile.temperature = Some(0.7);
+        let (outcome, _) = run(&mut agent, "go");
+        assert_eq!(outcome.stop, StopReason::Done);
+        let t: Vec<_> = temps.lock().unwrap().clone();
+        assert_eq!(t, vec![Some(0.7), Some(0.7)], "temps: {t:?}");
+    }
+
+    #[test]
+    fn recovery_temp_unchanged_when_server_default() {
+        // Server default (None) should stay None.
+        let (mut agent, _, temps) = scripted_agent(vec![length("boom"), done("ok")], None);
+        agent.config.profile.temperature = None;
+        let (outcome, _) = run(&mut agent, "go");
+        assert_eq!(outcome.stop, StopReason::Done);
+        let t: Vec<_> = temps.lock().unwrap().clone();
+        assert_eq!(t, vec![None, None], "temps: {t:?}");
+    }
+
+    #[test]
+    fn recovery_temp_fires_at_most_once_per_event() {
+        // Two length runaways → recovery should fire for the first retry
+        // only, then the second retry also gets recovery (since nudge is a
+        // new recovery event).
+        let (mut agent, _, temps) =
+            scripted_agent(vec![length("a"), length("b"), done("ok")], None);
+        agent.config.profile.temperature = Some(0.0);
+        let (outcome, _) = run(&mut agent, "go");
+        assert_eq!(outcome.stop, StopReason::Done);
+        let t: Vec<_> = temps.lock().unwrap().clone();
+        assert_eq!(t, vec![Some(0.0), Some(0.4), Some(0.4)], "temps: {t:?}");
     }
 }
