@@ -194,6 +194,18 @@ struct ToolCallAcc {
     announced: bool,
 }
 
+/// Endpoint path to append to the base_url. Bases that already carry an
+/// API version segment (…/api/v1, …/coding/paas/v4) get "/chat/completions";
+/// bare hosts like the local llama-server get the conventional
+/// "/v1/chat/completions".
+fn chat_path(base_url: &str) -> &'static str {
+    let last = base_url.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+    let versioned = last.len() >= 2
+        && last.starts_with('v')
+        && last[1..].bytes().all(|b| b.is_ascii_digit());
+    if versioned { "/chat/completions" } else { "/v1/chat/completions" }
+}
+
 /// POST a streaming chat completion. `on_delta` fires per streamed fragment;
 /// the assembled message is returned at the end.
 pub fn stream_chat(
@@ -204,7 +216,7 @@ pub fn stream_chat(
     cancel: Arc<AtomicBool>,
     mut on_delta: impl FnMut(Delta),
 ) -> Result<Completion> {
-    let url = Url::join(&profile.base_url, "/v1/chat/completions")?;
+    let url = Url::join(&profile.base_url, chat_path(&profile.base_url))?;
     let mut body = json!({
         "model": profile.model,
         "messages": messages.iter().map(Msg::to_wire).collect::<Vec<_>>(),
@@ -333,4 +345,19 @@ pub fn probe_ctx(profile: &Profile) -> Option<usize> {
     v.pointer("/default_generation_settings/n_ctx")
         .and_then(|n| n.as_u64())
         .map(|n| n as usize)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chat_path_respects_versioned_bases() {
+        assert_eq!(chat_path("http://localhost:8080"), "/v1/chat/completions");
+        assert_eq!(chat_path("https://openrouter.ai/api/v1"), "/chat/completions");
+        assert_eq!(chat_path("https://openrouter.ai/api/v1/"), "/chat/completions");
+        assert_eq!(chat_path("https://api.z.ai/api/coding/paas/v4/"), "/chat/completions");
+        // "v" followed by non-digits is not a version segment.
+        assert_eq!(chat_path("https://example.com/api/vein"), "/v1/chat/completions");
+    }
 }
