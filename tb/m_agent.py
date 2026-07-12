@@ -28,7 +28,7 @@ from terminal_bench.agents.installed_agents.abstract_installed_agent import (
 from terminal_bench.terminal.models import TerminalCommand
 
 M_RELEASE_URL = (
-    "https://github.com/dairycow/m/releases/download/v0.1.0/m-x86_64-linux-musl"
+    "https://github.com/dairycow/m/releases/download/v0.2.0/m-x86_64-linux-musl"
 )
 
 

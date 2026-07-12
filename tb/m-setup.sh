@@ -6,7 +6,7 @@
 # the container's default gateway (the docker host).
 set -e
 
-M_RELEASE_URL="https://github.com/dairycow/m/releases/download/v0.1.0/m-x86_64-linux-musl"
+M_RELEASE_URL="https://github.com/dairycow/m/releases/download/v0.2.0/m-x86_64-linux-musl"
 
 if [ ! -x /usr/local/bin/m ]; then
     if [ -f /usr/local/bin/m ]; then
