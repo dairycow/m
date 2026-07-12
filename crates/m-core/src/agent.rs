@@ -278,25 +278,12 @@ impl Agent {
                     self.session.push(Msg::tool_result(&call.id, "Cancelled by user."))?;
                     continue;
                 }
-                // Loop breaker: a third identical call with unchanged state
-                // is intercepted instead of executed.
+                // Repeat detection. Deliberately NOT a blocker: an A/B on the
+                // held-out bench slice showed that refusing to execute makes
+                // temp-0 loops stickier (the model loops on the refusal, and
+                // a frozen context is a fixed point). Executing keeps the
+                // context evolving; the annotation gives the model a way out.
                 let sig = Self::fnv(&call.function.name, &call.function.arguments);
-                if let Some(&(n, _)) = seen.get(&sig)
-                    && n >= 2
-                {
-                    on_event(AgentEvent::Notice(format!(
-                        "blocked repeated identical {} call",
-                        call.function.name
-                    )));
-                    self.session.push(Msg::tool_result(
-                        &call.id,
-                        "(Not executed: you have already run exactly this twice and nothing has \
-                         changed since. Repeating it will not help. Step back — re-read the \
-                         relevant source with the read tool, question your current hypothesis, \
-                         and take a different approach.)",
-                    ))?;
-                    continue;
-                }
                 on_event(AgentEvent::ToolStart {
                     name: call.function.name.clone(),
                     args: call.function.arguments.clone(),
@@ -314,10 +301,11 @@ impl Agent {
                         let (n, prev) = e.get_mut();
                         *n += 1;
                         if *prev == out_hash {
-                            out.content.push_str(
-                                "\n(note: identical output to the last time you ran exactly \
-                                 this — a different approach may be needed)",
-                            );
+                            out.content.push_str(&format!(
+                                "\n(note: you have run exactly this {n} times now with \
+                                 identical output — question the hypothesis that led here \
+                                 and try a different approach)",
+                            ));
                         }
                         *prev = out_hash;
                     }

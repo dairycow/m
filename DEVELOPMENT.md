@@ -99,11 +99,18 @@ Robustness layers, all tuned on SWE-bench trajectories (see bench/):
   of reasoning). The truncated message is *dropped from the wire* (kept in the
   session file), a corrective user message is appended, and the turn retries;
   up to 5 times, then `StopReason::Length`.
-- **Loop breaker**: tool calls are FNV-fingerprinted (name+args). 2nd
-  identical call: executes, and if the output is also identical a note is
-  appended to the result. 3rd: intercepted with a step-back directive instead
-  of executing. The seen-set clears on any successful `write`/`edit`, so
-  "edit → rerun test" cycles are never punished.
+- **Repeat detection** (not a blocker): tool calls are FNV-fingerprinted
+  (name+args); identical reruns with identical output get an escalating
+  note appended to the result. The seen-set clears on any successful
+  `write`/`edit`, so "edit → rerun test" cycles are never punished.
+  **History**: v2 *blocked* the third identical call — the held-out A/B
+  (heldout-v1 5/30 resolved vs heldout-v2 3/30, patches 18 vs 13) showed
+  blocking makes temp-0 loops stickier: a refused call leaves the context
+  frozen, which is a fixed point, and one instance the old scaffold
+  resolved (django-13933) spent 33/40 turns looping on the refusal.
+  Executing the redundant call keeps the context evolving. If loops return,
+  the next candidate is a temperature bump on the retry turn (resample out
+  of the attractor), not harder blocking.
 - **Context guard**: past 85% of the context window (true size probed from
   `/props` on a background thread), old tool outputs are clipped in memory,
   keeping the last 8 messages intact.
@@ -161,8 +168,13 @@ bench/.venv/bin/python -m swebench.harness.run_evaluation \
 **Anti-overfitting protocol.** `pick -n 30` (offset 0) is the *dev* slice —
 mine its trajectories for generic failure modes. `pick -n 30 --offset 5` is
 *held-out* — scaffold changes are judged only on it, and only behavioral fixes
-(loop breaking, budgets, prompt discipline) are allowed; nothing
+(loop handling, budgets, prompt discipline) are allowed; nothing
 instance- or repo-specific. One instance ≈ 3.3%, so treat <±7% as noise.
+Slice difficulty varies a lot: the same binary scored 36.7% on dev and
+16.7% on held-out. Always A/B on the *same* slice before crediting or
+blaming a scaffold change (build the old binary from git in a worktree and
+pass it to `m-bench run --bin`). Held-out slices wear out as you make
+decisions against them — retire to a fresh offset after a couple of uses.
 Trajectory triage one-liner: count `tool_start` repeats, nudge notices, and
 edit errors per `*.trajectory.jsonl` — that table is what motivated every
 scaffold change so far.
