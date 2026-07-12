@@ -44,15 +44,18 @@ fn main() {
         Some("pick") => cmd_pick(&args[1..]),
         Some("run") => cmd_run(&args[1..]),
         Some("report") => cmd_report(&args[1..]),
+        Some("triage") => cmd_triage(&args[1..]),
         _ => {
             eprintln!(
-                "usage: m-bench <fetch|pick|run|report> [options]\n\
+                "usage: m-bench <fetch|pick|run|report|triage> [options]\n\
                  \n\
                  fetch  [--out bench/dataset.json]\n\
                  pick   [-n 30] [--dataset bench/dataset.json]\n\
                  run    --instances FILE --out DIR [--dataset F] [--bin PATH]\n\
                  \x20      [--max-turns N] [--timeout SECONDS] [--keep]\n\
-                 report --run DIR [--eval swebench-report.json]"
+                 report --run DIR [--eval swebench-report.json]\n\
+                 triage --run DIR    failure-mode table from the trajectories\n\
+                 \x20      (works on bench/runs/* and Terminal-Bench tb/runs/*)"
             );
             2
         }
@@ -528,4 +531,257 @@ fn cmd_report(args: &[String]) -> i32 {
     println!("{md}");
     eprintln!("wrote {}", out.display());
     0
+}
+
+// ------------------------------------------------------------------ triage
+
+/// Failure-mode counters mined from one `m -p --json` trajectory. This is
+/// the table that motivated every scaffold change so far — see the
+/// anti-overfitting protocol in DEVELOPMENT.md.
+#[derive(Debug, Default, PartialEq)]
+struct Triage {
+    /// Parseable JSON events (0 → not a trajectory, skip the file).
+    events: u64,
+    /// Model turns (telemetry events).
+    turns: u64,
+    tool_calls: u64,
+    /// Tool calls that exactly repeat an earlier call (name + args).
+    repeated_calls: u64,
+    /// Highest execution count of a single identical call.
+    max_repeat: u64,
+    /// Token-limit runaways that were discarded and nudged.
+    nudges: u64,
+    edit_errors: u64,
+    tool_errors: u64,
+    /// From m's stderr markers (merged into the file): done | length |
+    /// max-turns | cancelled.
+    stop: String,
+}
+
+fn triage_trajectory(text: &str) -> Triage {
+    let mut t = Triage::default();
+    let mut seen: std::collections::HashMap<String, u64> = Default::default();
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            // m's stderr is merged into the trajectory; stop markers live there.
+            let line = line.trim();
+            if line.contains("m: stopped: reached --max-turns") {
+                t.stop = "max-turns".into();
+            } else if line.contains("m: stopped: token limit") {
+                t.stop = "length".into();
+            } else if line.contains("m: cancelled") {
+                t.stop = "cancelled".into();
+            }
+            continue;
+        };
+        t.events += 1;
+        match v.get("type").and_then(Value::as_str) {
+            Some("telemetry") => t.turns += 1,
+            Some("tool_start") => {
+                t.tool_calls += 1;
+                let sig = format!(
+                    "{}\0{}",
+                    v.get("name").and_then(Value::as_str).unwrap_or(""),
+                    v.get("args").and_then(Value::as_str).unwrap_or("")
+                );
+                let n = seen.entry(sig).or_insert(0);
+                *n += 1;
+                if *n > 1 {
+                    t.repeated_calls += 1;
+                }
+                t.max_repeat = t.max_repeat.max(*n);
+            }
+            Some("tool_end") => {
+                if v.get("is_error").and_then(Value::as_bool).unwrap_or(false) {
+                    t.tool_errors += 1;
+                    if v.get("name").and_then(Value::as_str) == Some("edit") {
+                        t.edit_errors += 1;
+                    }
+                }
+            }
+            Some("notice")
+                if v.get("text")
+                    .and_then(Value::as_str)
+                    // "… token limit — retrying (1/5)" (older binaries said
+                    // "nudging"); the bare "hit the token limit" is the stop.
+                    .is_some_and(|s| s.contains("token limit —")) =>
+            {
+                t.nudges += 1;
+            }
+            _ => {}
+        }
+    }
+    if t.stop.is_empty() && t.events > 0 {
+        t.stop = "done".into();
+    }
+    t
+}
+
+/// Trajectory files under a run dir, both layouts: SWE-bench
+/// (`<id>.trajectory.jsonl` flat) and Terminal-Bench
+/// (`<task>/<trial>/sessions/trajectory.jsonl`, or the legacy `m.log`).
+fn collect_trajectories(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            collect_trajectories(&p, out);
+        } else if let Some(name) = p.file_name().map(|n| n.to_string_lossy().into_owned())
+            && (name.ends_with("trajectory.jsonl") || name == "m.log" || name == "m.jsonl")
+        {
+            out.push(p);
+        }
+    }
+}
+
+/// `<task>.<k>-of-<n>.<timestamp>` → `<task>` (task ids may contain dots).
+fn strip_trial_suffix(name: &str) -> String {
+    let parts: Vec<&str> = name.split('.').collect();
+    for i in 1..parts.len() {
+        if let Some((a, b)) = parts[i].split_once("-of-")
+            && !a.is_empty()
+            && !b.is_empty()
+            && a.bytes().all(|c| c.is_ascii_digit())
+            && b.bytes().all(|c| c.is_ascii_digit())
+        {
+            return parts[..i].join(".");
+        }
+    }
+    name.to_string()
+}
+
+fn triage_label(path: &Path) -> String {
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    if let Some(id) = name.strip_suffix(".trajectory.jsonl")
+        && !id.is_empty()
+    {
+        return id.to_string();
+    }
+    // tb layout: nearest ancestor that isn't the sessions dir is the trial.
+    for anc in path.ancestors().skip(1) {
+        if let Some(d) = anc.file_name().map(|n| n.to_string_lossy())
+            && d != "sessions"
+        {
+            return strip_trial_suffix(&d);
+        }
+    }
+    name
+}
+
+fn cmd_triage(args: &[String]) -> i32 {
+    let run_dir = PathBuf::from(flag(args, "--run").unwrap_or_else(|| "bench/runs/run".into()));
+    let mut files = Vec::new();
+    collect_trajectories(&run_dir, &mut files);
+    files.sort();
+    if files.is_empty() {
+        eprintln!("m-bench: no trajectories under {}", run_dir.display());
+        return 1;
+    }
+
+    let mut rows: Vec<(String, Triage)> = Vec::new();
+    let mut skipped = 0usize;
+    for f in &files {
+        let text = std::fs::read_to_string(f).unwrap_or_default();
+        let t = triage_trajectory(&text);
+        if t.events == 0 {
+            skipped += 1; // plain-text log (pre --json adapter), not a trajectory
+            continue;
+        }
+        rows.push((triage_label(f), t));
+    }
+    if rows.is_empty() {
+        eprintln!(
+            "m-bench: {} files but none contain m --json events (old plain-text logs?)",
+            files.len()
+        );
+        return 1;
+    }
+    // Worst offenders first: repeats, then nudges, then tool errors.
+    rows.sort_by_key(|(id, t)| {
+        (std::cmp::Reverse(t.repeated_calls + t.nudges), std::cmp::Reverse(t.tool_errors), id.clone())
+    });
+
+    println!("| instance | turns | tools | repeats (max) | nudges | edit errs | tool errs | stop |");
+    println!("|---|---|---|---|---|---|---|---|");
+    let mut sum = Triage::default();
+    for (id, t) in &rows {
+        println!(
+            "| {id} | {} | {} | {} ({}) | {} | {} | {} | {} |",
+            t.turns, t.tool_calls, t.repeated_calls, t.max_repeat, t.nudges, t.edit_errors,
+            t.tool_errors, t.stop
+        );
+        sum.turns += t.turns;
+        sum.tool_calls += t.tool_calls;
+        sum.repeated_calls += t.repeated_calls;
+        sum.max_repeat = sum.max_repeat.max(t.max_repeat);
+        sum.nudges += t.nudges;
+        sum.edit_errors += t.edit_errors;
+        sum.tool_errors += t.tool_errors;
+    }
+    println!(
+        "| **total ({})** | {} | {} | {} ({}) | {} | {} | {} | |",
+        rows.len(),
+        sum.turns, sum.tool_calls, sum.repeated_calls, sum.max_repeat, sum.nudges,
+        sum.edit_errors, sum.tool_errors
+    );
+    if skipped > 0 {
+        eprintln!("({skipped} plain-text logs skipped — rerun with the --json adapter for full coverage)");
+    }
+    0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn triage_counts_failure_modes() {
+        let traj = concat!(
+            r#"{"type":"tool_start","name":"bash","args":"{\"command\":\"ls\"}"}"#, "\n",
+            r#"{"type":"tool_end","name":"bash","output":"a b","is_error":false}"#, "\n",
+            r#"{"type":"telemetry","prompt_tokens":100,"completion_tokens":10}"#, "\n",
+            r#"{"type":"notice","text":"response hit the token limit — retrying (1/5)"}"#, "\n",
+            r#"{"type":"tool_start","name":"edit","args":"{\"path\":\"f\"}"}"#, "\n",
+            r#"{"type":"tool_end","name":"edit","output":"old_string not found","is_error":true}"#, "\n",
+            r#"{"type":"telemetry","prompt_tokens":200,"completion_tokens":10}"#, "\n",
+            r#"{"type":"tool_start","name":"bash","args":"{\"command\":\"ls\"}"}"#, "\n",
+            r#"{"type":"tool_end","name":"bash","output":"a b","is_error":false}"#, "\n",
+            r#"{"type":"tool_start","name":"bash","args":"{\"command\":\"ls\"}"}"#, "\n",
+            r#"{"type":"tool_end","name":"bash","output":"a b","is_error":false}"#, "\n",
+            r#"{"type":"telemetry","prompt_tokens":300,"completion_tokens":10}"#, "\n",
+            "m: stopped: reached --max-turns\n",
+        );
+        let t = triage_trajectory(traj);
+        assert_eq!(t.turns, 3);
+        assert_eq!(t.tool_calls, 4);
+        assert_eq!(t.repeated_calls, 2);
+        assert_eq!(t.max_repeat, 3);
+        assert_eq!(t.nudges, 1);
+        assert_eq!(t.edit_errors, 1);
+        assert_eq!(t.tool_errors, 1);
+        assert_eq!(t.stop, "max-turns");
+    }
+
+    #[test]
+    fn triage_skips_plain_text() {
+        let t = triage_trajectory("just an answer\nno json here\n");
+        assert_eq!(t.events, 0);
+    }
+
+    #[test]
+    fn labels_both_layouts() {
+        assert_eq!(
+            triage_label(Path::new("runs/v1/django__django-12453.trajectory.jsonl")),
+            "django__django-12453"
+        );
+        assert_eq!(
+            triage_label(Path::new(
+                "tb/runs/x/broken-python/broken-python.1-of-1.2026-07-12__12-18-32/sessions/trajectory.jsonl"
+            )),
+            "broken-python"
+        );
+        // task ids may contain dots
+        assert_eq!(strip_trial_suffix("maze.easy.2-of-3.2026-07-12__10-00-00"), "maze.easy");
+        assert_eq!(strip_trial_suffix("plain-dir"), "plain-dir");
+    }
 }

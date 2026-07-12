@@ -153,6 +153,39 @@ pub enum Delta {
     ToolCallBegin { index: usize, name: String },
 }
 
+/// The chat endpoint as a seam: the agent loop talks to this trait, so
+/// tests can drive it with scripted completions (no server, no GPU) and
+/// alternative transports stay possible. The default is [`Http`], the
+/// hand-rolled SSE client below.
+pub trait ChatProvider: Send {
+    fn stream_chat(
+        &self,
+        profile: &Profile,
+        messages: &[Msg],
+        tools: &[ToolSpec],
+        temperature: Option<f32>,
+        cancel: Arc<AtomicBool>,
+        on_delta: &mut dyn FnMut(Delta),
+    ) -> Result<Completion>;
+}
+
+/// Default provider: streaming HTTP against the configured base_url.
+pub struct Http;
+
+impl ChatProvider for Http {
+    fn stream_chat(
+        &self,
+        profile: &Profile,
+        messages: &[Msg],
+        tools: &[ToolSpec],
+        temperature: Option<f32>,
+        cancel: Arc<AtomicBool>,
+        on_delta: &mut dyn FnMut(Delta),
+    ) -> Result<Completion> {
+        stream_chat(profile, messages, tools, temperature, cancel, on_delta)
+    }
+}
+
 #[derive(Default)]
 struct ToolCallAcc {
     id: String,

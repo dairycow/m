@@ -400,7 +400,7 @@ dependencies = [
 
 [[package]]
 name = "m-bench"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "m-core",
  "serde",
@@ -409,7 +409,7 @@ dependencies = [
 
 [[package]]
 name = "m-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dirs",
  "libc",
@@ -423,7 +423,7 @@ dependencies = [
 
 [[package]]
 name = "m-tui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "crossterm",
  "libc",
