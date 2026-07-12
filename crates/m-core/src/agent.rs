@@ -173,10 +173,15 @@ impl Agent {
              and its current state, key decisions, relevant file paths and their roles, and any \
              unfinished steps. Be concise but complete. Reply with only the summary.",
         ));
+        // Tool specs must stay on this request: llama.cpp's chat template
+        // renders them at the *start* of the prompt, so dropping them shifts
+        // every subsequent token and the server's prefix cache misses from
+        // token 0 — the whole history gets reprocessed (measured: 8.4s at a
+        // 25k-token session, ~0.06s with tools kept; scales linearly).
         let completion = self.provider.stream_chat(
             &self.config.profile,
             &wire,
-            &[],
+            &self.tools,
             self.config.profile.temperature,
             Arc::clone(&self.cancel),
             &mut |d| {
@@ -498,6 +503,9 @@ mod tests {
         replies: Mutex<VecDeque<Result<Completion>>>,
         wires: Arc<Mutex<Vec<Vec<Msg>>>>,
         temps: Arc<Mutex<Vec<Option<f32>>>>,
+        /// Tool-spec count of each request (prefix-cache regressions show
+        /// up here: a request without tools re-renders the whole prompt).
+        tools_seen: Arc<Mutex<Vec<usize>>>,
         /// Set the cancel flag while serving this (1-based) request.
         cancel_on_call: Option<usize>,
     }
@@ -510,7 +518,7 @@ mod tests {
             &self,
             _profile: &crate::config::Profile,
             messages: &[Msg],
-            _tools: &[ToolSpec],
+            tools: &[ToolSpec],
             temperature: Option<f32>,
             cancel: Arc<AtomicBool>,
             _on_delta: &mut dyn FnMut(Delta),
@@ -518,6 +526,7 @@ mod tests {
             let mut wires = self.wires.lock().unwrap();
             wires.push(messages.to_vec());
             self.temps.lock().unwrap().push(temperature);
+            self.tools_seen.lock().unwrap().push(tools.len());
             if self.cancel_on_call == Some(wires.len()) {
                 cancel.store(true, Ordering::SeqCst);
             }
@@ -592,9 +601,48 @@ mod tests {
             replies: Mutex::new(replies.into()),
             wires: Arc::clone(&wires),
             temps: Arc::clone(&temps),
+            tools_seen: Arc::new(Mutex::new(Vec::new())),
             cancel_on_call,
         }));
         (agent, wires, temps)
+    }
+
+    /// Like scripted_agent, but also returns the per-request tool-spec
+    /// counts the provider saw.
+    fn scripted_agent_recording_tools(
+        replies: Vec<Result<Completion>>,
+    ) -> (Agent, Arc<Mutex<Vec<usize>>>) {
+        let (mut agent, _, _) = scripted_agent(Vec::new(), None);
+        let tools_seen = Arc::new(Mutex::new(Vec::new()));
+        agent.set_provider(Box::new(Scripted {
+            replies: Mutex::new(replies.into()),
+            wires: Arc::new(Mutex::new(Vec::new())),
+            temps: Arc::new(Mutex::new(Vec::new())),
+            tools_seen: Arc::clone(&tools_seen),
+            cancel_on_call: None,
+        }));
+        (agent, tools_seen)
+    }
+
+    #[test]
+    fn compact_request_keeps_tool_specs() {
+        let (mut agent, tools_seen) = scripted_agent_recording_tools(vec![done("the summary")]);
+        agent.session.push(Msg::user("original task")).unwrap();
+        agent.session.push(Msg::user("lots of prior work")).unwrap();
+        agent.compact(&mut |_| {}).unwrap();
+        // The summarize request must carry the same tool specs as agent
+        // turns — dropping them shifts the rendered prompt from token 0
+        // and forfeits the server's prefix cache.
+        assert_eq!(tools_seen.lock().unwrap().as_slice(), &[4]);
+        // Fresh session seeded with the summary + ack.
+        assert_eq!(agent.session.messages.len(), 2);
+        assert!(
+            agent.session.messages[0]
+                .content
+                .as_deref()
+                .unwrap()
+                .contains("the summary")
+        );
     }
 
     fn run(agent: &mut Agent, prompt: &str) -> (RunOutcome, Vec<AgentEvent>) {
