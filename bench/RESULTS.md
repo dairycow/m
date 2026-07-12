@@ -44,3 +44,19 @@ Model: **Gemma 4 12B (Q5_K_XL) + MTP drafter** via llama.cpp on an RTX 4070 Ti S
 | sympy__sympy-22714 | ❌ not resolved | 14 | 2m17s | 692 B |
 
 Scoring: official harness — `python -m swebench.harness.run_evaluation --dataset_name SWE-bench/SWE-bench_Lite --predictions_path bench/runs/v1/predictions.jsonl --run_id m-bench --max_workers 4`
+
+## Held-out A/B — offset 7 (2026-07-12)
+
+Fresh 30-instance slice (`pick -n 30 --offset 7`, disjoint from dev and offset-5),
+main (b0f8660) vs `improve-truncated-tool-calls` (f21427d). Two old-arm docker-pull
+timeouts re-run on cached images and merged before scoring.
+
+| arm | resolved | empty patches | stop=length | stop=max-turns |
+|---|---|---|---|---|
+| main | 7/30 (23.3%) | 9 | 4 | 4 |
+| truncated-call discard | **8/30 (26.7%)** | 8 | 5 | 7 |
+
+Verdict: no regression; +1 resolved is within slice noise. The targeted failure
+mode (length-finish truncating tool-call arguments) did not occur in either arm
+on this slice — it appeared in 7/60 instances on the two earlier slices. Runs in
+`bench/runs/ab7-{old,new}`, reports in `m-gemma4-12b-mtp.m-ab7-{old,new}.json`.
