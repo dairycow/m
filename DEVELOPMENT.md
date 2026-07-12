@@ -32,7 +32,7 @@ crates/
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"
 cargo build --release             # host binaries: m, m-bench
-cargo test                        # 14 unit tests
+cargo test                        # 28 unit tests, incl. the scripted agent loop
 cargo clippy --all-targets        # kept at zero warnings
 
 # static agent for SWE-bench containers — no TLS, no C toolchain needed
@@ -74,9 +74,12 @@ llama-server reuses the KV prefix, so multi-turn latency stays near zero
 (e.g. the context guard) trades one cache refill for survival — do it rarely
 and deliberately.
 
-**The session file is a faithful log** (`session.rs`). Truncations, nudge
-discards, and context clipping apply to the in-memory copy only. Resume must
-always reconstruct what actually happened.
+**The session file is a faithful log** (`session.rs`). Context clipping
+applies to the in-memory copy only; resume must always reconstruct the
+conversation as the model saw it. (Length-runaway responses are the one
+deliberate exception: they are discarded before ever being pushed, so
+neither the wire nor the file carries them — resending a runaway reliably
+re-triggers it.)
 
 **Tool results are model-visible; `detail` is not** (`tools.rs`). The diff
 shown in the TUI rides on `ToolOutput::detail` and never reaches the model —
@@ -92,13 +95,19 @@ Per iteration: build wire messages (system + history, reasoning stripped) →
 `stream_chat` (one transport retry) → telemetry event → execute tool calls →
 inject queued steering input → repeat. Exit when a response has no tool calls.
 
+The loop talks to the model through the `ChatProvider` trait (`provider.rs`;
+`Http` is the production impl). That seam is what makes the loop testable:
+`agent.rs::tests` drives every layer below with scripted completions — no
+server, no GPU, milliseconds per test. Tune a robustness layer by writing
+the unit test first; the bench run is then confirmation, not exploration.
+
 Robustness layers, all tuned on SWE-bench trajectories (see bench/):
 
 - **Length nudges**: a `finish_reason == "length"` response with no tool call
   is a runaway (small models loop hard at temp 0 — one turn once produced 6MB
-  of reasoning). The truncated message is *dropped from the wire* (kept in the
-  session file), a corrective user message is appended, and the turn retries;
-  up to 5 times, then `StopReason::Length`.
+  of reasoning). The truncated message is *discarded* (never pushed to the
+  wire or the session), a corrective user message is appended, and the turn
+  retries; up to 5 times, then `StopReason::Length`.
 - **Repeat detection** (not a blocker): tool calls are FNV-fingerprinted
   (name+args); identical reruns with identical output get an escalating
   note appended to the result. The seen-set clears on any successful
@@ -174,10 +183,28 @@ Slice difficulty varies a lot: the same binary scored 36.7% on dev and
 16.7% on held-out. Always A/B on the *same* slice before crediting or
 blaming a scaffold change (build the old binary from git in a worktree and
 pass it to `m-bench run --bin`). Held-out slices wear out as you make
-decisions against them — retire to a fresh offset after a couple of uses.
-Trajectory triage one-liner: count `tool_start` repeats, nudge notices, and
-edit errors per `*.trajectory.jsonl` — that table is what motivated every
-scaffold change so far.
+decisions against them — retire to a fresh offset after a couple of uses
+(offset 5 has now judged two decisions; use a fresh offset next).
+
+Triage — the table that motivated every scaffold change so far — is a
+subcommand:
+
+```bash
+./target/release/m-bench triage --run bench/runs/<name>   # or tb/runs/<ts>
+```
+
+It reports per instance: turns, repeated identical tool calls, length
+nudges, edit errors, tool errors, and stop reason, worst offenders first.
+
+## Terminal-Bench
+
+Terminal-Bench measures the thesis directly (arbitrary terminal work, not
+just SWE patches) and is wired up in [tb/](tb/README.md). The adapter runs
+`m -p --json` teed to `/logs/trajectory.jsonl` in each task container, so
+`m-bench triage` reads tb runs and SWE-bench runs identically, and
+`tb/pick.py` gives the same deterministic dev/held-out discipline (43/43
+tasks, alternating over the sorted id list). The same anti-overfitting
+rules apply: mine dev, judge on held-out, behavioral fixes only.
 
 ## Working on m with m
 

@@ -8,3 +8,4 @@ bench/logs/
 tb/.venv/
 tb/tb-core/
 tb/runs/
+__pycache__/
