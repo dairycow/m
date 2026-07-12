@@ -7,7 +7,7 @@ mod input;
 mod md;
 mod theme;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
@@ -42,7 +42,8 @@ enum UiMsg {
     Ev(AgentEvent),
     RunDone(StopReason),
     RunErr(String),
-    SessionInfo { id: String, cells: Vec<CellKind> },
+    SessionInfo { id: String, path: PathBuf, cells: Vec<CellKind> },
+    RebuildDone(Result<(), String>),
 }
 
 // ---------------------------------------------------------------- cells
@@ -216,6 +217,8 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/resume", "pick a previous session"),
     ("/compact", "summarize the session to free context"),
     ("/skills", "list discovered skills"),
+    ("/reload", "hot-reload the running binary, keeping this session"),
+    ("/rebuild", "cargo build+test --release in the background, then hot-reload"),
     ("/quit", "exit m"),
 ];
 
@@ -239,8 +242,13 @@ pub struct App {
     steer: Arc<Mutex<std::collections::VecDeque<String>>>,
     cmd_tx: mpsc::Sender<AgentCmd>,
     ui_rx: mpsc::Receiver<UiMsg>,
+    /// A second sender handle so background jobs we spawn ourselves (e.g.
+    /// `/rebuild`) can report back without going through the agent thread.
+    ui_tx: mpsc::Sender<UiMsg>,
     profile_label: String,
+    profile_name: String,
     session_id: String,
+    session_path: PathBuf,
     n_skills: usize,
     user_commands: Vec<m_core::context::CommandTemplate>,
     picker: Option<Picker>,
@@ -249,6 +257,14 @@ pub struct App {
     cwd: PathBuf,
     dirty: bool,
     quit: bool,
+    /// Set right after `ctrl+x` while we wait for the completing `e`.
+    leader_x: Option<Instant>,
+    /// Set by `on_key` when the `ctrl+x ctrl+e` sequence completes; the
+    /// event loop notices this and suspends the TUI to run `$EDITOR`.
+    want_editor: bool,
+    /// A background `/rebuild` finished; swap into the new binary as soon
+    /// as the agent isn't mid-turn.
+    reload_pending: bool,
 }
 
 pub fn run_tui(
@@ -276,6 +292,7 @@ pub fn run_tui(
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<AgentCmd>();
     let (ui_tx, ui_rx) = mpsc::channel::<UiMsg>();
+    let app_ui_tx = ui_tx.clone();
 
     let mut app = App {
         cells: session_cells(&agent.session),
@@ -288,8 +305,11 @@ pub fn run_tui(
         steer: agent.steer.clone(),
         cmd_tx,
         ui_rx,
+        ui_tx: app_ui_tx,
         profile_label: format!("{}/{}", cfg.profile_name, cfg.profile.model),
+        profile_name: cfg.profile_name.clone(),
         session_id: agent.session.id.clone(),
+        session_path: agent.session.path.clone(),
         n_skills,
         user_commands,
         picker: None,
@@ -298,6 +318,9 @@ pub fn run_tui(
         cwd: cwd.clone(),
         dirty: true,
         quit: false,
+        leader_x: None,
+        want_editor: false,
+        reload_pending: false,
     };
     if app.cells.is_empty() {
         app.cells.push(Cell::new(CellKind::Notice(format!(
@@ -333,13 +356,18 @@ pub fn run_tui(
     }));
 
     let mut terminal = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
+    // A fresh Terminal's diff buffer starts blank, so it may skip cells it
+    // thinks are already empty. After a `/reload` exec() the physical
+    // screen can still hold the old process's leftover frame — force a
+    // full repaint so the first draw doesn't leave stale content behind.
+    terminal.clear()?;
     let perf = std::env::var("M_PERF").is_ok();
     let mut first_frame: Option<(Duration, u64)> = None;
     if perf {
         terminal.draw(|f| app.draw(f))?;
         first_frame = Some((t0.elapsed(), rss_kb()));
     }
-    let res = app.event_loop(&mut terminal);
+    let res = app.event_loop(&mut terminal, kitty);
     restore_terminal(kitty);
     if let Some((ttff, rss)) = first_frame {
         eprintln!(
@@ -377,6 +405,59 @@ fn restore_terminal(kitty: bool) {
     crossterm::terminal::disable_raw_mode().ok();
 }
 
+/// Re-enter the TUI's raw/alternate-screen mode after [`restore_terminal`]
+/// suspended it for a child process (e.g. `$EDITOR`).
+fn enter_terminal(kitty: bool) -> std::io::Result<()> {
+    crossterm::terminal::enable_raw_mode()?;
+    let mut out = std::io::stdout();
+    crossterm::execute!(
+        out,
+        crossterm::terminal::EnterAlternateScreen,
+        event::EnableMouseCapture
+    )?;
+    if kitty {
+        crossterm::execute!(
+            out,
+            event::PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+            )
+        )?;
+    }
+    Ok(())
+}
+
+/// Where `cargo build --release` puts this binary in the workspace this
+/// copy of `m` was built from, derived from `CARGO_MANIFEST_DIR`
+/// (`.../crates/m-tui`) rather than any runtime lookup.
+fn release_binary_path() -> Option<PathBuf> {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace_root = manifest_dir.parent()?.parent()?;
+    Some(workspace_root.join("target/release/m"))
+}
+
+/// Run `cargo <args>` in `cwd`, capturing rather than inheriting its
+/// stdout/stderr (the caller is a background thread while the TUI owns the
+/// terminal). On failure, `label` names the step in the error message.
+fn run_cargo_step(cwd: &Path, args: &[&str], label: &str) -> Result<(), String> {
+    let result = std::process::Command::new("cargo")
+        .args(args)
+        .current_dir(cwd)
+        .stdout(std::process::Stdio::null())
+        .output();
+    match result {
+        Ok(out) if out.status.success() => Ok(()),
+        Ok(out) => {
+            let last_line = String::from_utf8_lossy(&out.stderr)
+                .lines()
+                .next_back()
+                .unwrap_or("no output")
+                .to_string();
+            Err(format!("{label} failed: {last_line}"))
+        }
+        Err(e) => Err(format!("failed to run cargo {label}: {e}")),
+    }
+}
+
 fn spawn_agent_thread(
     mut agent: Agent,
     cmd_rx: mpsc::Receiver<AgentCmd>,
@@ -402,12 +483,12 @@ fn spawn_agent_thread(
                 }
                 AgentCmd::NewSession => match agent.new_session() {
                     Ok(()) => {
-                        ui_tx
-                            .send(UiMsg::SessionInfo {
-                                id: agent.session.id.clone(),
-                                cells: vec![CellKind::Notice("new session".into())],
-                            })
-                            .ok();
+                        ui_tx.send(UiMsg::SessionInfo {
+                            id: agent.session.id.clone(),
+                            path: agent.session.path.clone(),
+                            cells: vec![CellKind::Notice("new session".into())],
+                        })
+                        .ok();
                     }
                     Err(e) => {
                         ui_tx.send(UiMsg::RunErr(e.to_string())).ok();
@@ -419,6 +500,7 @@ fn spawn_agent_thread(
                         ui_tx
                             .send(UiMsg::SessionInfo {
                                 id: agent.session.id.clone(),
+                                path: agent.session.path.clone(),
                                 cells,
                             })
                             .ok();
@@ -435,14 +517,14 @@ fn spawn_agent_thread(
                     };
                     match agent.compact(&mut on_event) {
                         Ok(()) => {
-                            ui_tx
-                                .send(UiMsg::SessionInfo {
-                                    id: agent.session.id.clone(),
-                                    cells: vec![CellKind::Notice(
-                                        "session compacted into a fresh context".into(),
-                                    )],
-                                })
-                                .ok();
+                            ui_tx.send(UiMsg::SessionInfo {
+                                id: agent.session.id.clone(),
+                                path: agent.session.path.clone(),
+                                cells: vec![CellKind::Notice(
+                                    "session compacted into a fresh context".into(),
+                                )],
+                            })
+                            .ok();
                         }
                         Err(e) => {
                             ui_tx.send(UiMsg::RunErr(e.to_string())).ok();
@@ -526,6 +608,7 @@ impl App {
     fn event_loop(
         &mut self,
         terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+        kitty: bool,
     ) -> std::io::Result<()> {
         let frame_budget = Duration::from_millis(16);
         let mut last_draw = Instant::now() - frame_budget;
@@ -537,7 +620,13 @@ impl App {
             // Input.
             if event::poll(Duration::from_millis(if self.running { 33 } else { 250 }))? {
                 match event::read()? {
-                    Event::Key(k) if k.kind != KeyEventKind::Release => self.on_key(k),
+                    Event::Key(k) if k.kind != KeyEventKind::Release => {
+                        self.on_key(k);
+                        if self.want_editor {
+                            self.want_editor = false;
+                            self.open_external_editor(terminal, kitty);
+                        }
+                    }
                     Event::Mouse(me) => match me.kind {
                         MouseEventKind::ScrollUp => {
                             self.scroll_up += 3;
@@ -556,6 +645,18 @@ impl App {
                     }
                     _ => {}
                 }
+            }
+            // Clear a stale "ctrl+x" leader hint nobody completed.
+            if let Some(t) = self.leader_x
+                && t.elapsed() >= Duration::from_millis(1500)
+            {
+                self.leader_x = None;
+                self.dirty = true;
+            }
+            // A background rebuild finished; hot-reload as soon as we're idle.
+            if self.reload_pending && !self.running {
+                self.reload_pending = false;
+                self.reload();
             }
             // Spinner animation while running.
             if self.running && last_draw.elapsed() >= Duration::from_millis(120) {
@@ -591,13 +692,19 @@ impl App {
                 self.finalize_open_cells();
                 self.cells.push(Cell::new(CellKind::ErrorCell(e)));
             }
-            UiMsg::SessionInfo { id, cells } => {
+            UiMsg::SessionInfo { id, path, cells } => {
                 self.running = false;
                 self.session_id = id;
+                self.session_path = path;
                 self.cells = cells.into_iter().map(Cell::new).collect();
                 self.telemetry = None;
                 self.scroll_up = 0;
             }
+            UiMsg::RebuildDone(Ok(())) => {
+                self.notice("rebuild done — reloading…");
+                self.reload_pending = true;
+            }
+            UiMsg::RebuildDone(Err(e)) => self.notice(format!("rebuild failed: {e}")),
         }
     }
 
@@ -729,6 +836,23 @@ impl App {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         let alt = k.modifiers.contains(KeyModifiers::ALT);
         let shift = k.modifiers.contains(KeyModifiers::SHIFT);
+
+        let leader_pending = match self.leader_x.take() {
+            Some(t) => t.elapsed() < Duration::from_millis(1500),
+            None => false,
+        };
+        match leader_step(leader_pending, ctrl, k.code) {
+            LeaderOutcome::Armed => {
+                self.leader_x = Some(Instant::now());
+                return;
+            }
+            LeaderOutcome::OpenEditor => {
+                self.want_editor = true;
+                return;
+            }
+            LeaderOutcome::Pass => {}
+        }
+
         match k.code {
             KeyCode::Char('c') if ctrl => {
                 if self.running {
@@ -803,6 +927,94 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// Suspend the TUI, edit the current input in `$VISUAL`/`$EDITOR`
+    /// (falling back to `vi`), and load the result back on a clean exit.
+    fn open_external_editor(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+        kitty: bool,
+    ) {
+        let path = std::env::temp_dir().join(format!("m-input-{}.md", std::process::id()));
+        if std::fs::write(&path, self.editor.text()).is_err() {
+            return;
+        }
+        let editor_cmd = std::env::var("VISUAL")
+            .or_else(|_| std::env::var("EDITOR"))
+            .unwrap_or_else(|_| "vi".to_string());
+        let mut parts = editor_cmd.split_whitespace();
+        let Some(prog) = parts.next() else {
+            std::fs::remove_file(&path).ok();
+            return;
+        };
+        let args: Vec<&str> = parts.collect();
+
+        restore_terminal(kitty);
+        let result = std::process::Command::new(prog).args(&args).arg(&path).status();
+        enter_terminal(kitty).ok();
+        terminal.clear().ok();
+
+        match result {
+            Ok(status) if status.success() => {
+                if let Ok(new_text) = std::fs::read_to_string(&path) {
+                    self.editor.set(new_text.trim_end_matches('\n'));
+                }
+            }
+            Ok(_) => {} // editor exited non-zero (e.g. `:cq`): keep the original input
+            Err(e) => self.notice(format!("failed to launch editor '{prog}': {e}")),
+        }
+        std::fs::remove_file(&path).ok();
+        self.dirty = true;
+    }
+
+    /// Hot-reload: re-exec the freshly built binary in place, resuming this
+    /// exact session. On success this never returns (the process image is
+    /// replaced).
+    ///
+    /// Deliberately *not* `std::env::current_exe()`: `cargo build --release`
+    /// replaces `target/release/m` by rename, and on Linux `/proc/self/exe`
+    /// keeps pointing at the old, now-unlinked inode — `current_exe()`
+    /// reports it as `<path> (deleted)` and exec fails. `release_binary_path`
+    /// is a plain path computed from the workspace this copy was built
+    /// from, so the exec looks up whatever is *currently* linked there.
+    fn reload(&mut self) {
+        let exe = release_binary_path()
+            .filter(|p| p.exists())
+            .or_else(|| std::env::current_exe().ok());
+        let Some(exe) = exe else {
+            self.notice("reload failed: could not locate the m binary");
+            self.dirty = true;
+            return;
+        };
+        use std::os::unix::process::CommandExt;
+        let err = std::process::Command::new(&exe)
+            .arg("-C")
+            .arg(&self.cwd)
+            .arg("-m")
+            .arg(&self.profile_name)
+            .arg("--session")
+            .arg(&self.session_path)
+            .exec();
+        self.notice(format!("reload failed to exec {}: {err}", exe.display()));
+        self.dirty = true;
+    }
+
+    /// `cargo build --release` then `cargo test --release` in `self.cwd`,
+    /// off the UI thread — a build that compiles but fails its own tests
+    /// never gets hot-loaded over a working session. Both commands' own
+    /// stdout/stderr are captured (not inherited) so they don't corrupt the
+    /// alternate screen. `apply()` schedules a `reload()` once
+    /// `UiMsg::RebuildDone(Ok(()))` comes back.
+    fn spawn_rebuild(&mut self) {
+        self.notice("rebuilding in the background (cargo build --release)…");
+        let cwd = self.cwd.clone();
+        let tx = self.ui_tx.clone();
+        std::thread::spawn(move || {
+            let msg = run_cargo_step(&cwd, &["build", "--release"], "build")
+                .and_then(|()| run_cargo_step(&cwd, &["test", "--release"], "tests"));
+            tx.send(UiMsg::RebuildDone(msg)).ok();
+        });
     }
 
     fn toggle_last(&mut self, pred: impl Fn(&CellKind) -> bool) {
@@ -909,7 +1121,9 @@ impl App {
                 self.notice(
                     "enter send · shift/alt+enter newline · esc cancel · ctrl+c ×2 quit · \
                      ctrl+o expand tool · ctrl+t expand thinking · ctrl+r sessions · \
-                     pgup/pgdn or wheel scroll · /new /resume /compact /quit",
+                     ctrl+x ctrl+e edit in $EDITOR · \
+                     pgup/pgdn or wheel scroll · \
+                     /new /resume /compact /reload /rebuild /quit",
                 );
             }
             "/quit" => self.quit = true,
@@ -936,6 +1150,20 @@ impl App {
                     "{sys_skills} skills discovered (see system prompt index); \
                      {cmds} user slash commands"
                 ));
+            }
+            "/reload" => {
+                if self.running {
+                    self.notice("busy — esc to cancel first");
+                } else {
+                    self.reload();
+                }
+            }
+            "/rebuild" => {
+                if self.running {
+                    self.notice("busy — esc to cancel first");
+                } else {
+                    self.spawn_rebuild();
+                }
             }
             other => self.notice(format!("unknown command: {other}")),
         }
@@ -1037,15 +1265,14 @@ impl App {
     }
 
     fn draw_input(&mut self, f: &mut Frame, area: Rect) {
-        let border_style = if self.running {
-            theme::dim()
-        } else {
-            theme::accent()
-        };
-        let block = Block::default()
+        let border_style = if self.running { theme::dim() } else { theme::accent() };
+        let mut block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(border_style);
+        if self.leader_x.is_some() {
+            block = block.title(Span::styled(" ctrl+x ctrl+e: edit in $EDITOR ", theme::dim()));
+        }
         let inner = block.inner(area);
         f.render_widget(block, area);
         let text: Vec<Line> = self
@@ -1201,6 +1428,32 @@ impl App {
     }
 }
 
+/// Outcome of feeding a keypress through the emacs-style `ctrl+x` leader
+/// prefix used to open the input in `$EDITOR` (`ctrl+x ctrl+e`, mirroring
+/// bash readline's edit-and-execute-command).
+#[derive(Debug, PartialEq, Eq)]
+enum LeaderOutcome {
+    /// No leader sequence involved; caller handles the key as usual.
+    Pass,
+    /// `ctrl+x` seen; now waiting for the completing key.
+    Armed,
+    /// `ctrl+x` followed by `e`/`E` within the timeout: open the editor.
+    OpenEditor,
+}
+
+fn leader_step(pending: bool, ctrl: bool, code: KeyCode) -> LeaderOutcome {
+    if pending {
+        return match code {
+            KeyCode::Char('e') | KeyCode::Char('E') => LeaderOutcome::OpenEditor,
+            _ => LeaderOutcome::Pass,
+        };
+    }
+    if ctrl && matches!(code, KeyCode::Char('x')) {
+        return LeaderOutcome::Armed;
+    }
+    LeaderOutcome::Pass
+}
+
 fn ago(secs: u64) -> String {
     match secs {
         0..=59 => format!("{secs}s ago"),
@@ -1236,4 +1489,37 @@ fn telemetry_of(
         }
     }
     t
+}
+
+#[cfg(test)]
+mod leader_tests {
+    use super::*;
+
+    #[test]
+    fn ctrl_x_arms_the_leader() {
+        assert_eq!(leader_step(false, true, KeyCode::Char('x')), LeaderOutcome::Armed);
+    }
+
+    #[test]
+    fn plain_x_does_not_arm() {
+        assert_eq!(leader_step(false, false, KeyCode::Char('x')), LeaderOutcome::Pass);
+    }
+
+    #[test]
+    fn e_after_leader_opens_editor_ctrl_or_not() {
+        assert_eq!(leader_step(true, false, KeyCode::Char('e')), LeaderOutcome::OpenEditor);
+        assert_eq!(leader_step(true, true, KeyCode::Char('e')), LeaderOutcome::OpenEditor);
+        assert_eq!(leader_step(true, false, KeyCode::Char('E')), LeaderOutcome::OpenEditor);
+    }
+
+    #[test]
+    fn other_key_after_leader_passes_through_instead_of_opening() {
+        assert_eq!(leader_step(true, false, KeyCode::Char('q')), LeaderOutcome::Pass);
+        assert_eq!(leader_step(true, true, KeyCode::Char('c')), LeaderOutcome::Pass);
+    }
+
+    #[test]
+    fn second_ctrl_x_while_not_pending_rearms() {
+        assert_eq!(leader_step(false, true, KeyCode::Char('x')), LeaderOutcome::Armed);
+    }
 }
