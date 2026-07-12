@@ -112,3 +112,17 @@ pub fn load(profile: Option<&str>) -> Result<Config> {
         confirm: false,
     })
 }
+
+/// Names of every profile selectable via `load`: everything in
+/// config.toml's `[profiles.*]`, plus the built-in "local" (always valid
+/// even when absent from the file).
+pub fn profile_names() -> Vec<String> {
+    let path = config_dir().join("config.toml");
+    let file: ConfigFile = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| toml::from_str(&s).ok())
+        .unwrap_or_default();
+    let mut names: std::collections::BTreeSet<String> = file.profiles.keys().cloned().collect();
+    names.insert("local".to_string());
+    names.into_iter().collect()
+}
