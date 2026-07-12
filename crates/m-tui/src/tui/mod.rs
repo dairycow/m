@@ -36,6 +36,7 @@ enum AgentCmd {
     NewSession,
     LoadSession(PathBuf),
     Compact,
+    SwitchProfile(String),
 }
 
 enum UiMsg {
@@ -44,6 +45,7 @@ enum UiMsg {
     RunErr(String),
     SessionInfo { id: String, path: PathBuf, cells: Vec<CellKind> },
     RebuildDone(Result<(), String>),
+    ProfileSwitched { name: String, model: String },
 }
 
 // ---------------------------------------------------------------- cells
@@ -217,6 +219,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/resume", "pick a previous session"),
     ("/compact", "summarize the session to free context"),
     ("/skills", "list discovered skills"),
+    ("/model", "list or switch configured provider profiles"),
     ("/reload", "hot-reload the running binary, keeping this session"),
     ("/rebuild", "cargo build+test --release in the background, then hot-reload"),
     ("/quit", "exit m"),
@@ -531,6 +534,19 @@ fn spawn_agent_thread(
                         }
                     }
                 }
+                AgentCmd::SwitchProfile(name) => match agent.switch_profile(&name) {
+                    Ok(()) => {
+                        ui_tx
+                            .send(UiMsg::ProfileSwitched {
+                                name: agent.config.profile_name.clone(),
+                                model: agent.config.profile.model.clone(),
+                            })
+                            .ok();
+                    }
+                    Err(e) => {
+                        ui_tx.send(UiMsg::RunErr(e.to_string())).ok();
+                    }
+                },
             }
         }
     });
@@ -705,6 +721,11 @@ impl App {
                 self.reload_pending = true;
             }
             UiMsg::RebuildDone(Err(e)) => self.notice(format!("rebuild failed: {e}")),
+            UiMsg::ProfileSwitched { name, model } => {
+                self.profile_label = format!("{name}/{model}");
+                self.notice(format!("switched to profile '{name}' ({model})"));
+                self.profile_name = name;
+            }
         }
     }
 
@@ -900,8 +921,10 @@ impl App {
             KeyCode::Right if alt || ctrl => self.editor.word_right(),
             KeyCode::Left => self.editor.left(),
             KeyCode::Right => self.editor.right(),
-            KeyCode::Home => self.editor.home(),
-            KeyCode::End => self.editor.end(),
+            // Jump the transcript to the very top/bottom (ctrl+a/ctrl+e
+            // above cover start/end of the current input line).
+            KeyCode::Home => self.scroll_up = usize::MAX,
+            KeyCode::End => self.scroll_up = 0,
             KeyCode::Up => {
                 if self.slash_active() {
                     self.slash_sel = self.slash_sel.saturating_sub(1);
@@ -1123,7 +1146,7 @@ impl App {
                      ctrl+o expand tool · ctrl+t expand thinking · ctrl+r sessions · \
                      ctrl+x ctrl+e edit in $EDITOR · \
                      pgup/pgdn or wheel scroll · \
-                     /new /resume /compact /reload /rebuild /quit",
+                     /new /resume /compact /model /reload /rebuild /quit",
                 );
             }
             "/quit" => self.quit = true,
@@ -1150,6 +1173,24 @@ impl App {
                     "{sys_skills} skills discovered (see system prompt index); \
                      {cmds} user slash commands"
                 ));
+            }
+            "/model" => {
+                if args.is_empty() {
+                    let list = m_core::config::profile_names()
+                        .into_iter()
+                        .map(|n| {
+                            if n == self.profile_name { format!("{n} (current)") } else { n }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    self.notice(format!("profiles: {list} — /model <name> to switch"));
+                } else if args == self.profile_name {
+                    self.notice(format!("already on '{args}'"));
+                } else if self.running {
+                    self.notice("busy — esc to cancel first");
+                } else {
+                    self.cmd_tx.send(AgentCmd::SwitchProfile(args.to_string())).ok();
+                }
             }
             "/reload" => {
                 if self.running {

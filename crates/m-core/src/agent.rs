@@ -133,16 +133,7 @@ impl Agent {
         session: Session,
     ) -> Agent {
         let ctx_limit = Arc::new(AtomicUsize::new(config.profile.ctx));
-        // The local server knows its real context size; probe off the hot path.
-        {
-            let ctx_limit = Arc::clone(&ctx_limit);
-            let profile = config.profile.clone();
-            std::thread::spawn(move || {
-                if let Some(n) = provider::probe_ctx(&profile) {
-                    ctx_limit.store(n, Ordering::Relaxed);
-                }
-            });
-        }
+        spawn_ctx_probe(&ctx_limit, &config.profile);
         Agent {
             config,
             session,
@@ -172,6 +163,18 @@ impl Agent {
     pub fn new_session(&mut self) -> Result<()> {
         self.session = Session::new(&self.cwd, &self.config.profile.model)?;
         self.last_prompt_tokens = 0;
+        Ok(())
+    }
+
+    /// Switch to a different provider profile from config.toml, keeping the
+    /// session, cwd, and system prompt untouched. Re-probes the context
+    /// window for the new endpoint in the background.
+    pub fn switch_profile(&mut self, name: &str) -> Result<()> {
+        let new_cfg = crate::config::load(Some(name))?;
+        self.config.profile_name = new_cfg.profile_name;
+        self.config.profile = new_cfg.profile;
+        self.ctx_limit.store(self.config.profile.ctx, Ordering::Relaxed);
+        spawn_ctx_probe(&self.ctx_limit, &self.config.profile);
         Ok(())
     }
 
@@ -565,6 +568,17 @@ impl Agent {
             self.last_prompt_tokens = 0;
         }
     }
+}
+
+/// The local server knows its real context size; probe off the hot path.
+fn spawn_ctx_probe(ctx_limit: &Arc<AtomicUsize>, profile: &crate::config::Profile) {
+    let ctx_limit = Arc::clone(ctx_limit);
+    let profile = profile.clone();
+    std::thread::spawn(move || {
+        if let Some(n) = provider::probe_ctx(&profile) {
+            ctx_limit.store(n, Ordering::Relaxed);
+        }
+    });
 }
 
 #[cfg(test)]
