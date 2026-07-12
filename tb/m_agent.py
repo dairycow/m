@@ -95,9 +95,11 @@ class MAgent(AbstractInstalledAgent):
         quoted = shlex.quote(instruction)
         return [
             TerminalCommand(
+                # /logs is the task-logs mount in terminal-bench-core 0.1.x
+                # (this tb version doesn't mount CONTAINER_AGENT_LOGS_PATH).
                 command=(
                     f"m -p --max-turns 40 --max-tokens 4096 --temp 0 {quoted} "
-                    f"2>&1 | tee {self.CONTAINER_AGENT_LOGS_PATH}/m.log"
+                    f"2>&1 | tee /logs/m.log"
                 ),
                 min_timeout_sec=0.0,
                 max_timeout_sec=float("inf"),
