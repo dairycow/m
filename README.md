@@ -153,12 +153,21 @@ honest, that slice is treated as the *dev set* (its trajectories get mined
 for generic failure modes) while `m-bench pick -n 30 --offset 5` yields a
 disjoint *held-out* slice on which changes are actually judged. Only
 behavioral fixes are allowed — nothing instance- or repo-specific.
+`m-bench triage --run <dir>` prints the failure-mode table (repeated
+calls, nudges, edit errors, stop reason) that drives that mining.
+
+## Terminal-Bench
+
+m also runs as a [Terminal-Bench](https://github.com/laude-institute/terminal-bench)
+installed agent — the benchmark that measures the thesis directly. The
+adapter, a deterministic dev/held-out task split, and shared trajectory
+triage live in [tb/](tb/README.md).
 
 ## Build
 
 ```bash
 cargo build --release          # target/release/m, m-bench
-cargo test && cargo clippy     # 14 tests, zero warnings
+cargo test && cargo clippy     # 28 tests, zero warnings
 ```
 
 Workspace: `crates/m-core` (agent loop, provider, tools, sessions, config,
