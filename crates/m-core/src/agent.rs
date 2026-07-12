@@ -269,7 +269,18 @@ impl Agent {
             turns += 1;
 
             let tool_calls = completion.msg.tool_calls.clone().unwrap_or_default();
-            if tool_calls.is_empty() {
+            // A "length" finish while any call's arguments don't parse means
+            // the response was cut off mid-arguments. Executing the fragment
+            // just feeds an "Invalid JSON" error back (heldout runs: the model
+            // then reissues the same oversized call and loops). Treat it like
+            // a text runaway: discard the whole message and nudge, with
+            // tool-specific advice for `write` — the usual culprit, since a
+            // large file body can never fit under max_tokens.
+            let truncated_call = completion.finish_reason == "length"
+                && tool_calls
+                    .iter()
+                    .any(|c| serde_json::from_str::<serde_json::Value>(&c.function.arguments).is_err());
+            if tool_calls.is_empty() || truncated_call {
                 if completion.finish_reason == "length" {
                     // Truncated mid-thought (usually a reasoning runaway on
                     // small models). Retry fresh: the truncated message is
@@ -281,14 +292,49 @@ impl Agent {
                         on_event(AgentEvent::Notice(format!(
                             "response hit the token limit — retrying ({nudges}/{MAX_LENGTH_NUDGES})"
                         )));
-                        self.session.push(Msg::user(
+                        let nudge = if truncated_call {
+                            let name = tool_calls
+                                .iter()
+                                .find(|c| {
+                                    serde_json::from_str::<serde_json::Value>(
+                                        &c.function.arguments,
+                                    )
+                                    .is_err()
+                                })
+                                .map(|c| c.function.name.as_str())
+                                .unwrap_or("tool");
+                            if name == "write" {
+                                "(Your write call overran the token limit mid-arguments and \
+                                 was discarded. The content is too large for one response. \
+                                 Write the file in stages: a first write with the opening \
+                                 portion, then extend it with edit calls — or make targeted \
+                                 edits to the existing file instead of rewriting it.)"
+                                    .to_string()
+                            } else {
+                                format!(
+                                    "(Your {name} call overran the token limit mid-arguments \
+                                     and was discarded. Issue a smaller {name} call.)"
+                                )
+                            }
+                        } else {
                             "(Your previous response overran the token limit and was discarded. \
                              Do not repeat that reasoning. Take the next concrete step with a \
-                             single tool call, or give your final answer in a few sentences.)",
-                        ))?;
+                             single tool call, or give your final answer in a few sentences.)"
+                                .to_string()
+                        };
+                        self.session.push(Msg::user(nudge))?;
                         continue;
                     }
                     self.session.push(completion.msg.clone())?;
+                    // A stored half tool call must still be answered, or the
+                    // session is malformed on resume (every tool_call id
+                    // needs a matching tool result).
+                    for call in &tool_calls {
+                        self.session.push(Msg::tool_result(
+                            &call.id,
+                            "(Not executed: arguments truncated by the token limit.)",
+                        ))?;
+                    }
                     on_event(AgentEvent::Notice("response hit the token limit".into()));
                     return Ok(RunOutcome {
                         stop: StopReason::Length,
@@ -570,6 +616,13 @@ mod tests {
         })
     }
 
+    fn with_finish(c: Result<Completion>, finish: &str) -> Result<Completion> {
+        c.map(|mut c| {
+            c.finish_reason = finish.into();
+            c
+        })
+    }
+
     /// Agent in a unique temp cwd with a scripted provider; the dead
     /// base_url makes the background /props probe fail instantly.
     fn scripted_agent(
@@ -658,6 +711,60 @@ mod tests {
         assert_eq!(nudges, 5);
         // The final truncated answer is kept.
         assert_eq!(agent.session.messages.last().unwrap().content.as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn truncated_tool_call_is_discarded_and_nudged() {
+        // Arguments cut off mid-string by the token limit.
+        let broken = ("write", r#"{"path":"f.txt","content":"abc"#);
+        let (mut agent, wires, _) = scripted_agent(
+            vec![with_finish(tool_calls(&[broken]), "length"), done("ok")],
+            None,
+        );
+        let (outcome, _) = run(&mut agent, "go");
+        assert_eq!(outcome.stop, StopReason::Done);
+        // Nothing executed: no tool results, no file.
+        assert!(tool_results(&agent).is_empty());
+        assert!(!agent.cwd.join("f.txt").exists());
+        // The retry wire carries the write-specific nudge, not the fragment.
+        let flat: String = wires.lock().unwrap()[1]
+            .iter()
+            .filter_map(|m| m.content.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(flat.contains("write call overran the token limit"));
+        assert!(!flat.contains(r#""content":"abc"#));
+    }
+
+    #[test]
+    fn complete_tool_call_with_length_finish_still_executes() {
+        // The limit can cut a response after the arguments are complete;
+        // a parseable call is executed, not discarded.
+        let echo = ("bash", r#"{"command":"echo hi"}"#);
+        let (mut agent, _, _) = scripted_agent(
+            vec![with_finish(tool_calls(&[echo]), "length"), done("ok")],
+            None,
+        );
+        let (outcome, _) = run(&mut agent, "go");
+        assert_eq!(outcome.stop, StopReason::Done);
+        let results = tool_results(&agent);
+        assert_eq!(results.len(), 1);
+        assert!(results[0].contains("hi"));
+    }
+
+    #[test]
+    fn truncated_tool_call_exhaustion_answers_every_call() {
+        let broken = ("write", r#"{"path":"f.txt","content":"abc"#);
+        let replies =
+            (0..6).map(|_| with_finish(tool_calls(&[broken]), "length")).collect();
+        let (mut agent, _, _) = scripted_agent(replies, None);
+        let (outcome, _) = run(&mut agent, "go");
+        assert_eq!(outcome.stop, StopReason::Length);
+        // The kept half call is answered so the session stays well-formed
+        // for /resume.
+        let last = agent.session.messages.last().unwrap();
+        assert_eq!(last.role, "tool");
+        assert!(last.content.as_deref().unwrap().contains("Not executed"));
     }
 
     #[test]
