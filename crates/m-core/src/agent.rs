@@ -57,6 +57,10 @@ const CTX_GUARD_KEEP_TAIL: usize = 8;
 /// fixed point — the same context reproduces the same runaway; resampling
 /// is the way out. Applied only when the configured temperature is lower.
 const RECOVERY_TEMP: f32 = 0.4;
+/// Inject a turn-budget warning this many turns before max_turns. The
+/// model has no idea it's on turn 35 of 40 — this nudge converts some
+/// max-turn wanderers into the patched column.
+const BUDGET_WARN: usize = 4;
 
 pub struct Agent {
     pub config: Config,
@@ -362,6 +366,24 @@ impl Agent {
             for text in queued {
                 on_event(AgentEvent::UserInjected(text.clone()));
                 self.session.push(Msg::user(text))?;
+            }
+
+            // Turn-budget warning: the model doesn't know how many turns
+            // remain. One injected message, BUDGET_WARN turns before the
+            // limit — it gives the model a chance to commit its best fix.
+            if self.config.max_turns > 0 {
+                let remaining = self.config.max_turns.saturating_sub(turns);
+                if remaining == BUDGET_WARN {
+                    let msg = format!(
+                        "{remaining} turns remain. Commit your best fix now — \
+                         even if imperfect — and reply with a final summary. \
+                         Do not start new investigations."
+                    );
+                    on_event(AgentEvent::Notice(format!(
+                        "turn budget warning ({remaining} turns left)"
+                    )));
+                    self.session.push(Msg::user(&msg))?;
+                }
             }
 
             if self.config.max_turns > 0 && turns >= self.config.max_turns {
@@ -687,6 +709,46 @@ mod tests {
         let (outcome, _) = run(&mut agent, "go");
         assert_eq!(outcome.stop, StopReason::MaxTurns);
         assert_eq!(outcome.turns, 2);
+    }
+
+    #[test]
+    fn turn_budget_warning_fires_once() {
+        let echo = ("bash", r#"{"command":"echo hi"}"#);
+        // max_turns=6: turns 1-6 are tool-call turns. The budget warning
+        // fires after turn 2 (remaining = 6-2 = 4 = BUDGET_WARN).
+        let reps: Vec<_> = (0..6).map(|_| tool_calls(&[echo])).collect();
+        let (mut agent, _, _) = scripted_agent(reps, None);
+        agent.config.max_turns = 6;
+        let (outcome, events) = run(&mut agent, "go");
+        assert_eq!(outcome.stop, StopReason::MaxTurns);
+        assert_eq!(outcome.turns, 6);
+        // The warning notice fires exactly once.
+        let warnings: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::Notice(n) if n.contains("turn budget warning")))
+            .collect();
+        assert_eq!(warnings.len(), 1, "expected 1 warning, got {}: {warnings:?}", warnings.len());
+        // The user message is in the session.
+        assert!(agent.session.messages.iter().any(|m| {
+            m.role == "user"
+                && m.content.as_deref().is_some_and(|c| c.contains("4 turns remain"))
+        }));
+    }
+
+    #[test]
+    fn turn_budget_warning_absent_when_no_max_turns() {
+        let echo = ("bash", r#"{"command":"echo hi"}"#);
+        // No max_turns → no budget warning, ever. With a done() at the
+        // end to cleanly exit the loop.
+        let (mut agent, _, _) = scripted_agent(
+            vec![tool_calls(&[echo]), tool_calls(&[echo]), tool_calls(&[echo]), done("ok")],
+            None,
+        );
+        agent.config.max_turns = 0;
+        let (_, events) = run(&mut agent, "go");
+        assert!(!events.iter().any(
+            |e| matches!(e, AgentEvent::Notice(n) if n.contains("turn budget warning"))
+        ));
     }
 
     #[test]
