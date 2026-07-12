@@ -28,7 +28,7 @@ from terminal_bench.agents.installed_agents.abstract_installed_agent import (
 from terminal_bench.terminal.models import TerminalCommand
 
 M_RELEASE_URL = (
-    "https://github.com/dairycow/m/releases/download/v0.1.0/m-x86_64-linux-musl"
+    "https://github.com/dairycow/m/releases/download/v0.2.0/m-x86_64-linux-musl"
 )
 
 
@@ -97,9 +97,12 @@ class MAgent(AbstractInstalledAgent):
             TerminalCommand(
                 # /logs is the task-logs mount in terminal-bench-core 0.1.x
                 # (this tb version doesn't mount CONTAINER_AGENT_LOGS_PATH).
+                # --json so the teed file is the same event-stream trajectory
+                # m-bench produces; `m-bench triage --run tb/runs/<ts>` reads
+                # it (m's stderr stop markers are merged in deliberately).
                 command=(
-                    f"m -p --max-turns 40 --max-tokens 4096 --temp 0 {quoted} "
-                    f"2>&1 | tee /logs/m.log"
+                    f"m -p --json --max-turns 40 --max-tokens 4096 --temp 0 {quoted} "
+                    f"2>&1 | tee /logs/trajectory.jsonl"
                 ),
                 min_timeout_sec=0.0,
                 max_timeout_sec=float("inf"),

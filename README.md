@@ -50,10 +50,12 @@ startup number is a 100-run median of `m --version`.
   MTP draft-acceptance %, cached tokens. No other harness shows these.
 - **Sessions** are append-only JSONL under `~/.local/share/m/sessions/`,
   resumable (`m -r`, `ctrl+r` picker), faithful even across crashes.
-- **Small-model armor**, tuned on real SWE-bench trajectories: runaway
-  responses are discarded and retried with a corrective nudge instead of
-  poisoning the context, and a loop breaker intercepts the third identical
-  tool call so the agent steps back instead of spinning.
+- **Small-model armor**, tuned on real SWE-bench trajectories: capped
+  responses with runaways discarded and retried behind a corrective nudge
+  instead of poisoning the context, and repeated-identical-call detection.
+  (An A/B on the held-out slice showed that *blocking* repeated calls
+  backfires at temp 0 — the model loops on the refusal — so detection
+  annotates rather than blocks; see DEVELOPMENT.md for the data.)
 - **YOLO by default**, like pi. You are the permission system.
 
 ## Usage
@@ -112,11 +114,18 @@ Select with `m -m or` or `M_PROFILE=or`.
 docker images against the local server, and the official harness scores
 the patches. See [bench/RESULTS.md](bench/RESULTS.md).
 
-**Result (2026-07-12): 11/30 resolved (36.7%)** on a reproducible
-stratified 30-instance slice of SWE-bench Lite — entirely on the local
-Gemma 4 12B MTP server (temp 0, ≤40 turns, 4096-token responses).
-20/30 produced a patch; mean 21.9 turns and ~2 minutes of agent time per
-instance; 1h01m total.
+**Results (2026-07-12)**, entirely on the local Gemma 4 12B MTP server
+(temp 0, ≤40 turns, 4096-token responses), official harness scoring:
+
+| slice | resolved | patched |
+|---|---|---|
+| dev (offset 0) | **11/30 (36.7%)** | 20/30 |
+| held-out (offset 5) | **5/30 (16.7%)** | 18/30 |
+
+Same binary, same settings — the spread between slices is real difficulty
+variance, which is exactly why the held-out number is the one to trust
+(and why single-slice results you see elsewhere deserve suspicion). Mean
+~2 minutes of agent time per instance, ~1h per 30-instance run.
 
 ```bash
 # one-time
@@ -144,12 +153,21 @@ honest, that slice is treated as the *dev set* (its trajectories get mined
 for generic failure modes) while `m-bench pick -n 30 --offset 5` yields a
 disjoint *held-out* slice on which changes are actually judged. Only
 behavioral fixes are allowed — nothing instance- or repo-specific.
+`m-bench triage --run <dir>` prints the failure-mode table (repeated
+calls, nudges, edit errors, stop reason) that drives that mining.
+
+## Terminal-Bench
+
+m also runs as a [Terminal-Bench](https://github.com/laude-institute/terminal-bench)
+installed agent — the benchmark that measures the thesis directly. The
+adapter, a deterministic dev/held-out task split, and shared trajectory
+triage live in [tb/](tb/README.md).
 
 ## Build
 
 ```bash
 cargo build --release          # target/release/m, m-bench
-cargo test && cargo clippy     # 14 tests, zero warnings
+cargo test && cargo clippy     # 28 tests, zero warnings
 ```
 
 Workspace: `crates/m-core` (agent loop, provider, tools, sessions, config,
