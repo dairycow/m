@@ -1,0 +1,59 @@
+# PR / main gates. No model server, no Docker, no GPU.
+# Agent quality (m-bench / TUI smoke) stays local — see DEVELOPMENT.md.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: fmt
+        run: cargo fmt --all -- --check
+
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: test
+        run: cargo test
+
+      - name: release build
+        run: cargo build --release -p m-tui -p m-bench
+
+      # Cold-start budget from README: m --version is sub-millisecond locally.
+      # CI runners are noisier; gate on something that still catches real regressions.
+      - name: startup budget
+        run: |
+          set -euo pipefail
+          bin=./target/release/m
+          "$bin" --version
+          # 20-run median wall time (ms)
+          times=
+          for i in $(seq 1 20); do
+            t=$( { TIMEFORMAT='%R'; time "$bin" --version >/dev/null; } 2>&1 )
+            ms=$(awk -v s="$t" 'BEGIN { printf "%d", s * 1000 }')
+            times="$times $ms"
+          done
+          median=$(printf '%s\n' $times | sort -n | awk 'NR==10 {print; exit}')
+          echo "m --version median: ${median}ms (n=20)"
+          # 50ms is ~100× the local budget — flags accidental bloat, not scheduler noise
+          if [ "$median" -gt 50 ]; then
+            echo "startup regression: median ${median}ms > 50ms" >&2
+            exit 1
+          fi

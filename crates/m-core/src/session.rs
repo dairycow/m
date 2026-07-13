@@ -38,12 +38,17 @@ fn cwd_key(cwd: &Path) -> String {
         h ^= b as u64;
         h = h.wrapping_mul(0x100000001b3);
     }
-    let name = cwd.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    let name = cwd
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
     format!("{name}-{h:012x}")
 }
 
 fn sessions_dir(cwd: &Path) -> PathBuf {
-    crate::config::data_dir().join("sessions").join(cwd_key(cwd))
+    crate::config::data_dir()
+        .join("sessions")
+        .join(cwd_key(cwd))
 }
 
 fn now_unix() -> u64 {
@@ -67,7 +72,11 @@ impl Session {
             model: model.to_string(),
         });
         append_line(&path, &header)?;
-        Ok(Session { id, path, messages: Vec::new() })
+        Ok(Session {
+            id,
+            path,
+            messages: Vec::new(),
+        })
     }
 
     /// Most recently modified session for this cwd, if any.
@@ -91,7 +100,9 @@ impl Session {
     pub fn list(cwd: &Path) -> Vec<(PathBuf, u64, String)> {
         let dir = sessions_dir(cwd);
         let mut out = Vec::new();
-        let Ok(entries) = std::fs::read_dir(dir) else { return out };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return out;
+        };
         for entry in entries.flatten() {
             let p = entry.path();
             if !p.extension().is_some_and(|e| e == "jsonl") {
@@ -130,8 +141,15 @@ impl Session {
                 Err(_) => {} // tolerate partial trailing writes
             }
         }
-        let id = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-        Ok(Session { id, path: path.to_path_buf(), messages })
+        let id = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        Ok(Session {
+            id,
+            path: path.to_path_buf(),
+            messages,
+        })
     }
 
     pub fn push(&mut self, msg: Msg) -> Result<()> {
@@ -149,7 +167,8 @@ fn append_line(path: &Path, line: &Line) -> Result<()> {
         .map_err(|e| Error::msg(format!("{}: {e}", path.display())))?;
     let mut s = serde_json::to_string(line)?;
     s.push('\n');
-    f.write_all(s.as_bytes()).map_err(|e| Error::msg(format!("{}: {e}", path.display())))?;
+    f.write_all(s.as_bytes())
+        .map_err(|e| Error::msg(format!("{}: {e}", path.display())))?;
     Ok(())
 }
 

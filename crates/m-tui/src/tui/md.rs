@@ -22,7 +22,11 @@ pub fn render(md: &str, width: u16) -> Vec<Line<'static>> {
     let mut needs_blank = false;
 
     let style = |bold: u32, italic: u32, heading: Option<u32>| -> Style {
-        let mut s = if heading.is_some() { theme::heading() } else { Style::default() };
+        let mut s = if heading.is_some() {
+            theme::heading()
+        } else {
+            Style::default()
+        };
         if bold > 0 {
             s = s.add_modifier(Modifier::BOLD);
         }
@@ -206,9 +210,9 @@ pub fn wrap_spans(spans: Vec<Span<'static>>, width: usize, prefix: &str) -> Vec<
         // Split span content into words, preserving spaces.
         let mut word = String::new();
         let push_word = |word: &mut String,
-                             cur: &mut Vec<Span<'static>>,
-                             cur_w: &mut usize,
-                             lines: &mut Vec<Line<'static>>| {
+                         cur: &mut Vec<Span<'static>>,
+                         cur_w: &mut usize,
+                         lines: &mut Vec<Line<'static>>| {
             if word.is_empty() {
                 return;
             }
@@ -260,7 +264,12 @@ mod tests {
     fn text_of(lines: &[Line<'_>]) -> Vec<String> {
         lines
             .iter()
-            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
             .collect()
     }
 

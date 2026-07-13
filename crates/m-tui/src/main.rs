@@ -81,11 +81,16 @@ fn parse_args() -> Result<Args, String> {
             "--session" => a.session = Some(PathBuf::from(need("--session")?)),
             "-C" | "--dir" => a.dir = Some(PathBuf::from(need("--dir")?)),
             "--max-turns" => {
-                a.max_turns = need("--max-turns")?.parse().map_err(|_| "bad --max-turns")?
+                a.max_turns = need("--max-turns")?
+                    .parse()
+                    .map_err(|_| "bad --max-turns")?
             }
             "--max-tokens" => {
-                a.max_tokens =
-                    Some(need("--max-tokens")?.parse().map_err(|_| "bad --max-tokens")?)
+                a.max_tokens = Some(
+                    need("--max-tokens")?
+                        .parse()
+                        .map_err(|_| "bad --max-tokens")?,
+                )
             }
             "--temp" => a.temp = Some(need("--temp")?.parse().map_err(|_| "bad --temp")?),
             "-V" | "--version" => {
@@ -180,10 +185,7 @@ fn run_print(args: Args, cfg: config::Config, cwd: PathBuf) -> i32 {
 
     let (sys, skills) = build_env(&cwd);
     let agent = if args.resume || args.session.is_some() {
-        let path = args
-            .session
-            .clone()
-            .or_else(|| Session::latest(&cwd));
+        let path = args.session.clone().or_else(|| Session::latest(&cwd));
         match path {
             Some(p) => Agent::resume(cfg, cwd, sys, skills, &p),
             None => {
@@ -226,7 +228,9 @@ fn run_print(args: Args, cfg: config::Config, cwd: PathBuf) -> i32 {
                     eprintln!("* {name} {summary}");
                 }
             }
-            AgentEvent::ToolEnd { is_error, output, .. } => {
+            AgentEvent::ToolEnd {
+                is_error, output, ..
+            } => {
                 if is_error {
                     let first = output.lines().next().unwrap_or("");
                     if color {
@@ -274,9 +278,21 @@ fn run_print(args: Args, cfg: config::Config, cwd: PathBuf) -> i32 {
 pub fn summarize_args(name: &str, args: &str) -> String {
     let v: serde_json::Value = serde_json::from_str(args).unwrap_or_default();
     let s = match name {
-        "bash" => v.get("command").and_then(|c| c.as_str()).unwrap_or("").to_string(),
-        "skill" => v.get("name").and_then(|c| c.as_str()).unwrap_or("").to_string(),
-        _ => v.get("path").and_then(|c| c.as_str()).unwrap_or("").to_string(),
+        "bash" => v
+            .get("command")
+            .and_then(|c| c.as_str())
+            .unwrap_or("")
+            .to_string(),
+        "skill" => v
+            .get("name")
+            .and_then(|c| c.as_str())
+            .unwrap_or("")
+            .to_string(),
+        _ => v
+            .get("path")
+            .and_then(|c| c.as_str())
+            .unwrap_or("")
+            .to_string(),
     };
     m_core::http::truncate(s.replace('\n', " ⏎ ").trim(), 120)
 }
@@ -289,7 +305,12 @@ fn print_json_event(ev: &AgentEvent) {
         AgentEvent::ToolStart { name, args } => {
             json!({"type": "tool_start", "name": name, "args": args})
         }
-        AgentEvent::ToolEnd { name, output, is_error, .. } => {
+        AgentEvent::ToolEnd {
+            name,
+            output,
+            is_error,
+            ..
+        } => {
             json!({"type": "tool_end", "name": name, "output": output, "is_error": is_error})
         }
         AgentEvent::UserInjected(s) => json!({"type": "user_injected", "text": s}),
