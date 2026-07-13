@@ -81,24 +81,35 @@ impl Editor {
     }
 
     pub fn home(&mut self) {
-        self.cursor = self.text[..self.cursor].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        self.cursor = self.text[..self.cursor]
+            .rfind('\n')
+            .map(|i| i + 1)
+            .unwrap_or(0);
     }
 
     pub fn end(&mut self) {
-        self.cursor =
-            self.text[self.cursor..].find('\n').map(|i| self.cursor + i).unwrap_or(self.text.len());
+        self.cursor = self.text[self.cursor..]
+            .find('\n')
+            .map(|i| self.cursor + i)
+            .unwrap_or(self.text.len());
     }
 
     pub fn word_left(&mut self) {
         let before = &self.text[..self.cursor];
         let trimmed = before.trim_end_matches(|c: char| !c.is_alphanumeric());
         let base = trimmed.trim_end_matches(|c: char| c.is_alphanumeric());
-        self.cursor = base.len().min(self.cursor.saturating_sub(1)).max(base.len());
+        self.cursor = base
+            .len()
+            .min(self.cursor.saturating_sub(1))
+            .max(base.len());
     }
 
     pub fn word_right(&mut self) {
         let after = &self.text[self.cursor..];
-        let skip_non = after.len() - after.trim_start_matches(|c: char| !c.is_alphanumeric()).len();
+        let skip_non = after.len()
+            - after
+                .trim_start_matches(|c: char| !c.is_alphanumeric())
+                .len();
         let rest = &after[skip_non..];
         let skip_word = rest.len() - rest.trim_start_matches(|c: char| c.is_alphanumeric()).len();
         self.cursor += skip_non + skip_word;
@@ -112,15 +123,20 @@ impl Editor {
     }
 
     pub fn kill_to_start(&mut self) {
-        let start = self.text[..self.cursor].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let start = self.text[..self.cursor]
+            .rfind('\n')
+            .map(|i| i + 1)
+            .unwrap_or(0);
         self.kill = self.text[start..self.cursor].to_string();
         self.text.replace_range(start..self.cursor, "");
         self.cursor = start;
     }
 
     pub fn kill_to_end(&mut self) {
-        let end =
-            self.text[self.cursor..].find('\n').map(|i| self.cursor + i).unwrap_or(self.text.len());
+        let end = self.text[self.cursor..]
+            .find('\n')
+            .map(|i| self.cursor + i)
+            .unwrap_or(self.text.len());
         self.kill = self.text[self.cursor..end].to_string();
         self.text.replace_range(self.cursor..end, "");
     }
@@ -139,7 +155,11 @@ impl Editor {
     }
 
     pub fn lines(&self) -> Vec<&str> {
-        if self.text.is_empty() { vec![""] } else { self.text.split('\n').collect() }
+        if self.text.is_empty() {
+            vec![""]
+        } else {
+            self.text.split('\n').collect()
+        }
     }
 
     /// Move up a line, or into history when already at the top line.
@@ -192,8 +212,7 @@ impl Editor {
         let mut offset = 0usize;
         for (i, line) in self.text.split('\n').enumerate() {
             if i == row {
-                let byte: usize =
-                    line.chars().take(col).map(char::len_utf8).sum();
+                let byte: usize = line.chars().take(col).map(char::len_utf8).sum();
                 self.cursor = offset + byte;
                 return;
             }

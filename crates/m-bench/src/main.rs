@@ -64,7 +64,9 @@ fn main() {
 }
 
 fn flag(args: &[String], name: &str) -> Option<String> {
-    args.iter().position(|a| a == name).and_then(|i| args.get(i + 1).cloned())
+    args.iter()
+        .position(|a| a == name)
+        .and_then(|i| args.get(i + 1).cloned())
 }
 
 fn has_flag(args: &[String], name: &str) -> bool {
@@ -106,7 +108,11 @@ fn cmd_fetch(args: &[String]) -> i32 {
             }
         };
         let total = v.get("num_rows_total").and_then(Value::as_u64).unwrap_or(0) as usize;
-        let page = v.get("rows").and_then(Value::as_array).cloned().unwrap_or_default();
+        let page = v
+            .get("rows")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
         for r in &page {
             if let Some(row) = r.get("row")
                 && let Ok(inst) = serde_json::from_value::<Instance>(row.clone())
@@ -140,7 +146,9 @@ fn load_dataset(path: &str) -> Result<Vec<Instance>, String> {
 /// dataset; different offsets give disjoint slices (dev vs held-out).
 fn cmd_pick(args: &[String]) -> i32 {
     let n: usize = flag(args, "-n").and_then(|s| s.parse().ok()).unwrap_or(30);
-    let offset: usize = flag(args, "--offset").and_then(|s| s.parse().ok()).unwrap_or(0);
+    let offset: usize = flag(args, "--offset")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
     let dataset = flag(args, "--dataset").unwrap_or_else(|| "bench/dataset.json".into());
     let rows = match load_dataset(&dataset) {
         Ok(r) => r,
@@ -181,11 +189,16 @@ fn cmd_run(args: &[String]) -> i32 {
         dataset: flag(args, "--dataset").unwrap_or_else(|| "bench/dataset.json".into()),
         instances: flag(args, "--instances").unwrap_or_else(|| "bench/instances.txt".into()),
         out: PathBuf::from(flag(args, "--out").unwrap_or_else(|| "bench/runs/run".into())),
-        bin: PathBuf::from(flag(args, "--bin").unwrap_or_else(|| {
-            "target/x86_64-unknown-linux-musl/release/m".into()
-        })),
-        max_turns: flag(args, "--max-turns").and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_MAX_TURNS),
-        timeout: flag(args, "--timeout").and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_TIMEOUT_S),
+        bin: PathBuf::from(
+            flag(args, "--bin")
+                .unwrap_or_else(|| "target/x86_64-unknown-linux-musl/release/m".into()),
+        ),
+        max_turns: flag(args, "--max-turns")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_MAX_TURNS),
+        timeout: flag(args, "--timeout")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_TIMEOUT_S),
         keep: has_flag(args, "--keep"),
     };
     if !cfg.bin.exists() {
@@ -204,7 +217,11 @@ fn cmd_run(args: &[String]) -> i32 {
         }
     };
     let want = match std::fs::read_to_string(&cfg.instances) {
-        Ok(s) => s.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty() && !l.starts_with('#')).collect::<Vec<_>>(),
+        Ok(s) => s
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .collect::<Vec<_>>(),
         Err(e) => {
             eprintln!("m-bench: {}: {e}", cfg.instances);
             return 1;
@@ -269,7 +286,10 @@ fn sh(cmd: &str, timeout: Duration) -> Result<String, String> {
 
 fn image_of(instance_id: &str) -> String {
     // Docker Hub forbids "__"; the official images encode it as "_1776_".
-    format!("swebench/sweb.eval.x86_64.{}:latest", instance_id.replace("__", "_1776_"))
+    format!(
+        "swebench/sweb.eval.x86_64.{}:latest",
+        instance_id.replace("__", "_1776_")
+    )
 }
 
 fn prompt_of(inst: &Instance) -> String {
@@ -302,26 +322,40 @@ fn run_instance(cfg: &RunCfg, inst: &Instance) -> Result<Value, String> {
     let cname = format!("m-bench-{}", id.replace("__", "-"));
 
     // Pull if missing (long timeout: multi-GB images).
-    sh(&format!("docker image inspect {image} >/dev/null 2>&1 || docker pull -q {image}"),
-        Duration::from_secs(1800))
-        .map_err(|e| format!("pull {image}: {e}"))?;
+    sh(
+        &format!("docker image inspect {image} >/dev/null 2>&1 || docker pull -q {image}"),
+        Duration::from_secs(1800),
+    )
+    .map_err(|e| format!("pull {image}: {e}"))?;
 
-    let _ = sh(&format!("docker rm -f {cname} 2>/dev/null"), Duration::from_secs(60));
-    sh(&format!("docker run -d --name {cname} --network host {image} tail -f /dev/null"),
-        Duration::from_secs(120))
-        .map_err(|e| format!("start container: {e}"))?;
+    let _ = sh(
+        &format!("docker rm -f {cname} 2>/dev/null"),
+        Duration::from_secs(60),
+    );
+    sh(
+        &format!("docker run -d --name {cname} --network host {image} tail -f /dev/null"),
+        Duration::from_secs(120),
+    )
+    .map_err(|e| format!("start container: {e}"))?;
 
     let result = (|| -> Result<Value, String> {
-        sh(&format!("docker cp {} {cname}:/usr/local/bin/m", cfg.bin.display()),
-            Duration::from_secs(60))
-            .map_err(|e| format!("copy agent: {e}"))?;
+        sh(
+            &format!("docker cp {} {cname}:/usr/local/bin/m", cfg.bin.display()),
+            Duration::from_secs(60),
+        )
+        .map_err(|e| format!("copy agent: {e}"))?;
 
         // Prompt via file to avoid any quoting pitfalls.
         let prompt_path = cfg.out.join(format!("{id}.prompt.txt"));
         std::fs::write(&prompt_path, prompt_of(inst)).map_err(|e| e.to_string())?;
-        sh(&format!("docker cp {} {cname}:/tmp/m-prompt.txt", prompt_path.display()),
-            Duration::from_secs(60))
-            .map_err(|e| format!("copy prompt: {e}"))?;
+        sh(
+            &format!(
+                "docker cp {} {cname}:/tmp/m-prompt.txt",
+                prompt_path.display()
+            ),
+            Duration::from_secs(60),
+        )
+        .map_err(|e| format!("copy prompt: {e}"))?;
 
         // Conda env python first on PATH, as the swebench images lay it out.
         // The trajectory goes to a file in the container (docker cp'd out
@@ -340,7 +374,10 @@ fn run_instance(cfg: &RunCfg, inst: &Instance) -> Result<Value, String> {
         let secs = started.elapsed().as_secs();
         let traj_path = cfg.out.join(format!("{id}.trajectory.jsonl"));
         let _ = sh(
-            &format!("docker cp {cname}:/tmp/m-traj.jsonl {}", traj_path.display()),
+            &format!(
+                "docker cp {cname}:/tmp/m-traj.jsonl {}",
+                traj_path.display()
+            ),
             Duration::from_secs(60),
         );
         let trajectory = std::fs::read_to_string(&traj_path).unwrap_or_default();
@@ -354,11 +391,15 @@ fn run_instance(cfg: &RunCfg, inst: &Instance) -> Result<Value, String> {
         let mut completion_tokens = 0u64;
         let mut tok_per_sec = Vec::new();
         for line in trajectory.lines() {
-            let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+            let Ok(v) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
             if let Some("telemetry") = v.get("type").and_then(Value::as_str) {
                 turns += 1;
-                completion_tokens +=
-                    v.get("completion_tokens").and_then(Value::as_u64).unwrap_or(0);
+                completion_tokens += v
+                    .get("completion_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
                 if let Some(t) = v.get("tok_per_sec").and_then(Value::as_f64)
                     && t > 0.0
                 {
@@ -373,7 +414,11 @@ fn run_instance(cfg: &RunCfg, inst: &Instance) -> Result<Value, String> {
                 Duration::from_secs(120),
             )
             .unwrap_or_default();
-            if p.starts_with("(no output") { String::new() } else { p }
+            if p.starts_with("(no output") {
+                String::new()
+            } else {
+                p
+            }
         };
         let mut patch = read_patch(&cname);
 
@@ -392,7 +437,10 @@ fn run_instance(cfg: &RunCfg, inst: &Instance) -> Result<Value, String> {
             );
             let _ = sh(&retry_exec, Duration::from_secs(cfg.timeout.min(600)));
             let _ = sh(
-                &format!("docker cp {cname}:/tmp/m-traj.jsonl {}", traj_path.display()),
+                &format!(
+                    "docker cp {cname}:/tmp/m-traj.jsonl {}",
+                    traj_path.display()
+                ),
                 Duration::from_secs(60),
             );
             patch = read_patch(&cname);
@@ -446,14 +494,19 @@ fn cmd_report(args: &[String]) -> i32 {
         .as_ref()
         .and_then(|v| v.get("resolved_ids"))
         .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
 
     let mut metas: Vec<Value> = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&run_dir) {
         for e in entries.flatten() {
             let p = e.path();
-            if p.file_name().is_some_and(|n| n.to_string_lossy().ends_with(".meta.json"))
+            if p.file_name()
+                .is_some_and(|n| n.to_string_lossy().ends_with(".meta.json"))
                 && let Ok(s) = std::fs::read_to_string(&p)
                 && let Ok(v) = serde_json::from_str::<Value>(&s)
             {
@@ -461,7 +514,12 @@ fn cmd_report(args: &[String]) -> i32 {
             }
         }
     }
-    metas.sort_by_key(|m| m.get("instance_id").and_then(Value::as_str).unwrap_or("").to_string());
+    metas.sort_by_key(|m| {
+        m.get("instance_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    });
     if metas.is_empty() {
         eprintln!("m-bench: no *.meta.json in {}", run_dir.display());
         return 1;
@@ -473,15 +531,25 @@ fn cmd_report(args: &[String]) -> i32 {
         .filter(|m| m.get("patch_bytes").and_then(Value::as_u64).unwrap_or(0) > 0)
         .count();
     let n_res = resolved.len();
-    let tot_secs: u64 = metas.iter().filter_map(|m| m.get("seconds").and_then(Value::as_u64)).sum();
-    let tot_turns: u64 = metas.iter().filter_map(|m| m.get("turns").and_then(Value::as_u64)).sum();
+    let tot_secs: u64 = metas
+        .iter()
+        .filter_map(|m| m.get("seconds").and_then(Value::as_u64))
+        .sum();
+    let tot_turns: u64 = metas
+        .iter()
+        .filter_map(|m| m.get("turns").and_then(Value::as_u64))
+        .sum();
     let mean_tps: f64 = {
         let v: Vec<f64> = metas
             .iter()
             .filter_map(|m| m.get("mean_tok_per_sec").and_then(Value::as_f64))
             .filter(|t| *t > 0.0)
             .collect();
-        if v.is_empty() { 0.0 } else { v.iter().sum::<f64>() / v.len() as f64 }
+        if v.is_empty() {
+            0.0
+        } else {
+            v.iter().sum::<f64>() / v.len() as f64
+        }
     };
 
     let mut md = String::new();
@@ -492,12 +560,24 @@ fn cmd_report(args: &[String]) -> i32 {
     ));
     md.push_str("| metric | value |\n|---|---|\n");
     if eval.is_some() {
-        md.push_str(&format!("| **resolved** | **{n_res}/{n}** ({:.1}%) |\n", n_res as f64 * 100.0 / n as f64));
+        md.push_str(&format!(
+            "| **resolved** | **{n_res}/{n}** ({:.1}%) |\n",
+            n_res as f64 * 100.0 / n as f64
+        ));
     }
     md.push_str(&format!("| patch generated | {n_patch}/{n} |\n"));
-    md.push_str(&format!("| total wall time | {}h{:02}m |\n", tot_secs / 3600, (tot_secs % 3600) / 60));
-    md.push_str(&format!("| mean turns | {:.1} |\n", tot_turns as f64 / n as f64));
-    md.push_str(&format!("| mean generation speed | {mean_tps:.0} tok/s |\n\n"));
+    md.push_str(&format!(
+        "| total wall time | {}h{:02}m |\n",
+        tot_secs / 3600,
+        (tot_secs % 3600) / 60
+    ));
+    md.push_str(&format!(
+        "| mean turns | {:.1} |\n",
+        tot_turns as f64 / n as f64
+    ));
+    md.push_str(&format!(
+        "| mean generation speed | {mean_tps:.0} tok/s |\n\n"
+    ));
     md.push_str("| instance | outcome | turns | time | patch |\n|---|---|---|---|---|\n");
     for m in &metas {
         let id = m.get("instance_id").and_then(Value::as_str).unwrap_or("?");
@@ -507,7 +587,11 @@ fn cmd_report(args: &[String]) -> i32 {
         } else if m.get("error").is_some() {
             "💥 error"
         } else if patch > 0 {
-            if eval.is_some() { "❌ not resolved" } else { "patch" }
+            if eval.is_some() {
+                "❌ not resolved"
+            } else {
+                "patch"
+            }
         } else {
             "— no patch"
         };
@@ -621,7 +705,9 @@ fn triage_trajectory(text: &str) -> Triage {
 /// (`<id>.trajectory.jsonl` flat) and Terminal-Bench
 /// (`<task>/<trial>/sessions/trajectory.jsonl`, or the legacy `m.log`).
 fn collect_trajectories(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     for e in entries.flatten() {
         let p = e.path();
         if p.is_dir() {
@@ -651,7 +737,10 @@ fn strip_trial_suffix(name: &str) -> String {
 }
 
 fn triage_label(path: &Path) -> String {
-    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
     if let Some(id) = name.strip_suffix(".trajectory.jsonl")
         && !id.is_empty()
     {
@@ -698,17 +787,29 @@ fn cmd_triage(args: &[String]) -> i32 {
     }
     // Worst offenders first: repeats, then nudges, then tool errors.
     rows.sort_by_key(|(id, t)| {
-        (std::cmp::Reverse(t.repeated_calls + t.nudges), std::cmp::Reverse(t.tool_errors), id.clone())
+        (
+            std::cmp::Reverse(t.repeated_calls + t.nudges),
+            std::cmp::Reverse(t.tool_errors),
+            id.clone(),
+        )
     });
 
-    println!("| instance | turns | tools | repeats (max) | nudges | edit errs | tool errs | stop |");
+    println!(
+        "| instance | turns | tools | repeats (max) | nudges | edit errs | tool errs | stop |"
+    );
     println!("|---|---|---|---|---|---|---|---|");
     let mut sum = Triage::default();
     for (id, t) in &rows {
         println!(
             "| {id} | {} | {} | {} ({}) | {} | {} | {} | {} |",
-            t.turns, t.tool_calls, t.repeated_calls, t.max_repeat, t.nudges, t.edit_errors,
-            t.tool_errors, t.stop
+            t.turns,
+            t.tool_calls,
+            t.repeated_calls,
+            t.max_repeat,
+            t.nudges,
+            t.edit_errors,
+            t.tool_errors,
+            t.stop
         );
         sum.turns += t.turns;
         sum.tool_calls += t.tool_calls;
@@ -721,11 +822,18 @@ fn cmd_triage(args: &[String]) -> i32 {
     println!(
         "| **total ({})** | {} | {} | {} ({}) | {} | {} | {} | |",
         rows.len(),
-        sum.turns, sum.tool_calls, sum.repeated_calls, sum.max_repeat, sum.nudges,
-        sum.edit_errors, sum.tool_errors
+        sum.turns,
+        sum.tool_calls,
+        sum.repeated_calls,
+        sum.max_repeat,
+        sum.nudges,
+        sum.edit_errors,
+        sum.tool_errors
     );
     if skipped > 0 {
-        eprintln!("({skipped} plain-text logs skipped — rerun with the --json adapter for full coverage)");
+        eprintln!(
+            "({skipped} plain-text logs skipped — rerun with the --json adapter for full coverage)"
+        );
     }
     0
 }
@@ -737,18 +845,30 @@ mod tests {
     #[test]
     fn triage_counts_failure_modes() {
         let traj = concat!(
-            r#"{"type":"tool_start","name":"bash","args":"{\"command\":\"ls\"}"}"#, "\n",
-            r#"{"type":"tool_end","name":"bash","output":"a b","is_error":false}"#, "\n",
-            r#"{"type":"telemetry","prompt_tokens":100,"completion_tokens":10}"#, "\n",
-            r#"{"type":"notice","text":"response hit the token limit — retrying (1/5)"}"#, "\n",
-            r#"{"type":"tool_start","name":"edit","args":"{\"path\":\"f\"}"}"#, "\n",
-            r#"{"type":"tool_end","name":"edit","output":"old_string not found","is_error":true}"#, "\n",
-            r#"{"type":"telemetry","prompt_tokens":200,"completion_tokens":10}"#, "\n",
-            r#"{"type":"tool_start","name":"bash","args":"{\"command\":\"ls\"}"}"#, "\n",
-            r#"{"type":"tool_end","name":"bash","output":"a b","is_error":false}"#, "\n",
-            r#"{"type":"tool_start","name":"bash","args":"{\"command\":\"ls\"}"}"#, "\n",
-            r#"{"type":"tool_end","name":"bash","output":"a b","is_error":false}"#, "\n",
-            r#"{"type":"telemetry","prompt_tokens":300,"completion_tokens":10}"#, "\n",
+            r#"{"type":"tool_start","name":"bash","args":"{\"command\":\"ls\"}"}"#,
+            "\n",
+            r#"{"type":"tool_end","name":"bash","output":"a b","is_error":false}"#,
+            "\n",
+            r#"{"type":"telemetry","prompt_tokens":100,"completion_tokens":10}"#,
+            "\n",
+            r#"{"type":"notice","text":"response hit the token limit — retrying (1/5)"}"#,
+            "\n",
+            r#"{"type":"tool_start","name":"edit","args":"{\"path\":\"f\"}"}"#,
+            "\n",
+            r#"{"type":"tool_end","name":"edit","output":"old_string not found","is_error":true}"#,
+            "\n",
+            r#"{"type":"telemetry","prompt_tokens":200,"completion_tokens":10}"#,
+            "\n",
+            r#"{"type":"tool_start","name":"bash","args":"{\"command\":\"ls\"}"}"#,
+            "\n",
+            r#"{"type":"tool_end","name":"bash","output":"a b","is_error":false}"#,
+            "\n",
+            r#"{"type":"tool_start","name":"bash","args":"{\"command\":\"ls\"}"}"#,
+            "\n",
+            r#"{"type":"tool_end","name":"bash","output":"a b","is_error":false}"#,
+            "\n",
+            r#"{"type":"telemetry","prompt_tokens":300,"completion_tokens":10}"#,
+            "\n",
             "m: stopped: reached --max-turns\n",
         );
         let t = triage_trajectory(traj);
@@ -781,7 +901,10 @@ mod tests {
             "broken-python"
         );
         // task ids may contain dots
-        assert_eq!(strip_trial_suffix("maze.easy.2-of-3.2026-07-12__10-00-00"), "maze.easy");
+        assert_eq!(
+            strip_trial_suffix("maze.easy.2-of-3.2026-07-12__10-00-00"),
+            "maze.easy"
+        );
         assert_eq!(strip_trial_suffix("plain-dir"), "plain-dir");
     }
 }

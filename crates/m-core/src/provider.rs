@@ -150,7 +150,10 @@ pub enum Delta {
     Reasoning(String),
     Content(String),
     /// A tool call's name became known (arguments still streaming).
-    ToolCallBegin { index: usize, name: String },
+    ToolCallBegin {
+        index: usize,
+        name: String,
+    },
 }
 
 /// The chat endpoint as a seam: the agent loop talks to this trait, so
@@ -199,11 +202,18 @@ struct ToolCallAcc {
 /// bare hosts like the local llama-server get the conventional
 /// "/v1/chat/completions".
 fn chat_path(base_url: &str) -> &'static str {
-    let last = base_url.trim_end_matches('/').rsplit('/').next().unwrap_or("");
-    let versioned = last.len() >= 2
-        && last.starts_with('v')
-        && last[1..].bytes().all(|b| b.is_ascii_digit());
-    if versioned { "/chat/completions" } else { "/v1/chat/completions" }
+    let last = base_url
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or("");
+    let versioned =
+        last.len() >= 2 && last.starts_with('v') && last[1..].bytes().all(|b| b.is_ascii_digit());
+    if versioned {
+        "/chat/completions"
+    } else {
+        "/v1/chat/completions"
+    }
 }
 
 /// POST a streaming chat completion. `on_delta` fires per streamed fragment;
@@ -234,8 +244,11 @@ pub fn stream_chat(
     }
 
     let auth = format!("Bearer {}", profile.api_key);
-    let headers: Vec<(&str, &str)> =
-        if profile.api_key.is_empty() { vec![] } else { vec![("Authorization", &auth)] };
+    let headers: Vec<(&str, &str)> = if profile.api_key.is_empty() {
+        vec![]
+    } else {
+        vec![("Authorization", &auth)]
+    };
     let body_bytes = serde_json::to_vec(&body)?;
     let mut resp = http::post_json(&url, &headers, &body_bytes, cancel)?;
 
@@ -244,10 +257,15 @@ pub fn stream_chat(
         let msg = serde_json::from_str::<Value>(&text)
             .ok()
             .and_then(|v| {
-                v.pointer("/error/message").and_then(|m| m.as_str()).map(str::to_string)
+                v.pointer("/error/message")
+                    .and_then(|m| m.as_str())
+                    .map(str::to_string)
             })
             .unwrap_or_else(|| http::truncate(&text, 400));
-        return Err(Error::msg(format!("API error (HTTP {}): {}", resp.status, msg)));
+        return Err(Error::msg(format!(
+            "API error (HTTP {}): {}",
+            resp.status, msg
+        )));
     }
 
     let mut content = String::new();
@@ -258,7 +276,9 @@ pub fn stream_chat(
     let mut timings: Option<Timings> = None;
 
     while let Some(line) = resp.next_line()? {
-        let Some(data) = line.strip_prefix("data:") else { continue };
+        let Some(data) = line.strip_prefix("data:") else {
+            continue;
+        };
         let data = data.trim();
         if data == "[DONE]" {
             break;
@@ -273,11 +293,15 @@ pub fn stream_chat(
         if let Some(t) = chunk.get("timings").filter(|t| !t.is_null()) {
             timings = serde_json::from_value(t.clone()).ok();
         }
-        let Some(choice) = chunk.pointer("/choices/0") else { continue };
+        let Some(choice) = chunk.pointer("/choices/0") else {
+            continue;
+        };
         if let Some(fr) = choice.get("finish_reason").and_then(|v| v.as_str()) {
             finish_reason = fr.to_string();
         }
-        let Some(delta) = choice.get("delta") else { continue };
+        let Some(delta) = choice.get("delta") else {
+            continue;
+        };
         if let Some(s) = delta.get("reasoning_content").and_then(|v| v.as_str())
             && !s.is_empty()
         {
@@ -308,7 +332,10 @@ pub fn stream_chat(
                 }
                 if !acc.announced && !acc.name.is_empty() {
                     acc.announced = true;
-                    on_delta(Delta::ToolCallBegin { index, name: acc.name.clone() });
+                    on_delta(Delta::ToolCallBegin {
+                        index,
+                        name: acc.name.clone(),
+                    });
                 }
             }
         }
@@ -319,20 +346,44 @@ pub fn stream_chat(
         .filter(|a| !a.name.is_empty())
         .enumerate()
         .map(|(i, a)| ToolCall {
-            id: if a.id.is_empty() { format!("call_{i}") } else { a.id },
+            id: if a.id.is_empty() {
+                format!("call_{i}")
+            } else {
+                a.id
+            },
             kind: "function".into(),
-            function: FunctionCall { name: a.name, arguments: a.arguments },
+            function: FunctionCall {
+                name: a.name,
+                arguments: a.arguments,
+            },
         })
         .collect();
 
     let msg = Msg {
         role: "assistant".into(),
-        content: if content.is_empty() && !tool_calls.is_empty() { None } else { Some(content) },
-        tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls) },
+        content: if content.is_empty() && !tool_calls.is_empty() {
+            None
+        } else {
+            Some(content)
+        },
+        tool_calls: if tool_calls.is_empty() {
+            None
+        } else {
+            Some(tool_calls)
+        },
         tool_call_id: None,
-        reasoning: if reasoning.is_empty() { None } else { Some(reasoning) },
+        reasoning: if reasoning.is_empty() {
+            None
+        } else {
+            Some(reasoning)
+        },
     };
-    Ok(Completion { msg, finish_reason, usage, timings })
+    Ok(Completion {
+        msg,
+        finish_reason,
+        usage,
+        timings,
+    })
 }
 
 /// Query llama-server's /props for the true context size. Returns None for
@@ -354,10 +405,22 @@ mod tests {
     #[test]
     fn chat_path_respects_versioned_bases() {
         assert_eq!(chat_path("http://localhost:8080"), "/v1/chat/completions");
-        assert_eq!(chat_path("https://openrouter.ai/api/v1"), "/chat/completions");
-        assert_eq!(chat_path("https://openrouter.ai/api/v1/"), "/chat/completions");
-        assert_eq!(chat_path("https://api.z.ai/api/coding/paas/v4/"), "/chat/completions");
+        assert_eq!(
+            chat_path("https://openrouter.ai/api/v1"),
+            "/chat/completions"
+        );
+        assert_eq!(
+            chat_path("https://openrouter.ai/api/v1/"),
+            "/chat/completions"
+        );
+        assert_eq!(
+            chat_path("https://api.z.ai/api/coding/paas/v4/"),
+            "/chat/completions"
+        );
         // "v" followed by non-digits is not a version segment.
-        assert_eq!(chat_path("https://example.com/api/vein"), "/v1/chat/completions");
+        assert_eq!(
+            chat_path("https://example.com/api/vein"),
+            "/v1/chat/completions"
+        );
     }
 }
