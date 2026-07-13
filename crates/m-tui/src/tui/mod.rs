@@ -51,8 +51,15 @@ enum UiMsg {
 enum CellKind {
     User(String),
     Queued(String),
-    Thinking { text: String, done: bool, expanded: bool },
-    Assistant { md: String, done: bool },
+    Thinking {
+        text: String,
+        done: bool,
+        expanded: bool,
+    },
+    Assistant {
+        md: String,
+        done: bool,
+    },
     Tool {
         name: String,
         summary: String,
@@ -73,7 +80,11 @@ struct Cell {
 
 impl Cell {
     fn new(kind: CellKind) -> Cell {
-        Cell { kind, version: 0, cache: None }
+        Cell {
+            kind,
+            version: 0,
+            cache: None,
+        }
     }
     fn touch(&mut self) {
         self.version += 1;
@@ -104,7 +115,11 @@ fn render_cell(kind: &CellKind, width: u16) -> Vec<Line<'static>> {
             w,
             "",
         ),
-        CellKind::Thinking { text, done, expanded } => {
+        CellKind::Thinking {
+            text,
+            done,
+            expanded,
+        } => {
             if *done && !*expanded {
                 let words = text.split_whitespace().count();
                 vec![Line::styled(
@@ -124,7 +139,14 @@ fn render_cell(kind: &CellKind, width: u16) -> Vec<Line<'static>> {
             }
         }
         CellKind::Assistant { md: text, .. } => md::render(text, width),
-        CellKind::Tool { name, summary, output, is_error, detail, expanded } => {
+        CellKind::Tool {
+            name,
+            summary,
+            output,
+            is_error,
+            detail,
+            expanded,
+        } => {
             let (glyph, gstyle) = match is_error {
                 None => ("…", theme::dim()),
                 Some(false) => ("✓", Style::default().fg(theme::ADD)),
@@ -173,9 +195,11 @@ fn render_cell(kind: &CellKind, width: u16) -> Vec<Line<'static>> {
         CellKind::Notice(text) => {
             md::wrap_spans(vec![Span::styled(format!("· {text}"), theme::dim())], w, "")
         }
-        CellKind::ErrorCell(text) => {
-            md::wrap_spans(vec![Span::styled(format!("✗ {text}"), theme::error())], w, "")
-        }
+        CellKind::ErrorCell(text) => md::wrap_spans(
+            vec![Span::styled(format!("✗ {text}"), theme::error())],
+            w,
+            "",
+        ),
     }
 }
 
@@ -318,7 +342,11 @@ pub fn run_tui(
     let res = app.event_loop(&mut terminal);
     restore_terminal(kitty);
     if let Some((ttff, rss)) = first_frame {
-        eprintln!("m: first frame {:.1}ms · rss {:.1}MB", ttff.as_secs_f64() * 1000.0, rss as f64 / 1024.0);
+        eprintln!(
+            "m: first frame {:.1}ms · rss {:.1}MB",
+            ttff.as_secs_f64() * 1000.0,
+            rss as f64 / 1024.0
+        );
     }
     res?;
     Ok(0)
@@ -328,9 +356,9 @@ fn rss_kb() -> u64 {
     std::fs::read_to_string("/proc/self/status")
         .ok()
         .and_then(|s| {
-            s.lines().find(|l| l.starts_with("VmRSS:")).and_then(|l| {
-                l.split_whitespace().nth(1).and_then(|v| v.parse().ok())
-            })
+            s.lines()
+                .find(|l| l.starts_with("VmRSS:"))
+                .and_then(|l| l.split_whitespace().nth(1).and_then(|v| v.parse().ok()))
         })
         .unwrap_or(0)
 }
@@ -374,11 +402,12 @@ fn spawn_agent_thread(
                 }
                 AgentCmd::NewSession => match agent.new_session() {
                     Ok(()) => {
-                        ui_tx.send(UiMsg::SessionInfo {
-                            id: agent.session.id.clone(),
-                            cells: vec![CellKind::Notice("new session".into())],
-                        })
-                        .ok();
+                        ui_tx
+                            .send(UiMsg::SessionInfo {
+                                id: agent.session.id.clone(),
+                                cells: vec![CellKind::Notice("new session".into())],
+                            })
+                            .ok();
                     }
                     Err(e) => {
                         ui_tx.send(UiMsg::RunErr(e.to_string())).ok();
@@ -387,7 +416,11 @@ fn spawn_agent_thread(
                 AgentCmd::LoadSession(path) => match agent.load_session(&path) {
                     Ok(()) => {
                         let cells: Vec<CellKind> = kinds_of(session_cells(&agent.session));
-                        ui_tx.send(UiMsg::SessionInfo { id: agent.session.id.clone(), cells })
+                        ui_tx
+                            .send(UiMsg::SessionInfo {
+                                id: agent.session.id.clone(),
+                                cells,
+                            })
                             .ok();
                     }
                     Err(e) => {
@@ -402,13 +435,14 @@ fn spawn_agent_thread(
                     };
                     match agent.compact(&mut on_event) {
                         Ok(()) => {
-                            ui_tx.send(UiMsg::SessionInfo {
-                                id: agent.session.id.clone(),
-                                cells: vec![CellKind::Notice(
-                                    "session compacted into a fresh context".into(),
-                                )],
-                            })
-                            .ok();
+                            ui_tx
+                                .send(UiMsg::SessionInfo {
+                                    id: agent.session.id.clone(),
+                                    cells: vec![CellKind::Notice(
+                                        "session compacted into a fresh context".into(),
+                                    )],
+                                })
+                                .ok();
                         }
                         Err(e) => {
                             ui_tx.send(UiMsg::RunErr(e.to_string())).ok();
@@ -430,7 +464,9 @@ fn session_cells(session: &Session) -> Vec<Cell> {
     let mut open_tools: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for msg in &session.messages {
         match msg.role.as_str() {
-            "user" => cells.push(Cell::new(CellKind::User(msg.content.clone().unwrap_or_default()))),
+            "user" => cells.push(Cell::new(CellKind::User(
+                msg.content.clone().unwrap_or_default(),
+            ))),
             "assistant" => {
                 if let Some(r) = &msg.reasoning
                     && !r.is_empty()
@@ -444,7 +480,10 @@ fn session_cells(session: &Session) -> Vec<Cell> {
                 if let Some(c) = &msg.content
                     && !c.is_empty()
                 {
-                    cells.push(Cell::new(CellKind::Assistant { md: c.clone(), done: true }));
+                    cells.push(Cell::new(CellKind::Assistant {
+                        md: c.clone(),
+                        done: true,
+                    }));
                 }
                 for call in msg.tool_calls.iter().flatten() {
                     cells.push(Cell::new(CellKind::Tool {
@@ -464,7 +503,9 @@ fn session_cells(session: &Session) -> Vec<Cell> {
             "tool" => {
                 if let Some(id) = &msg.tool_call_id
                     && let Some(&i) = open_tools.get(id)
-                    && let CellKind::Tool { output, is_error, .. } = &mut cells[i].kind
+                    && let CellKind::Tool {
+                        output, is_error, ..
+                    } = &mut cells[i].kind
                 {
                     let content = msg.content.clone().unwrap_or_default();
                     *is_error = Some(
@@ -563,8 +604,9 @@ impl App {
     fn apply_agent_event(&mut self, ev: AgentEvent) {
         match ev {
             AgentEvent::Reasoning(s) => {
-                if let Some(CellKind::Thinking { text, done: false, .. }) =
-                    self.cells.last_mut().map(|c| &mut c.kind)
+                if let Some(CellKind::Thinking {
+                    text, done: false, ..
+                }) = self.cells.last_mut().map(|c| &mut c.kind)
                 {
                     text.push_str(&s);
                 } else {
@@ -583,7 +625,8 @@ impl App {
                     md.push_str(&s);
                 } else {
                     self.close_thinking();
-                    self.cells.push(Cell::new(CellKind::Assistant { md: s, done: false }));
+                    self.cells
+                        .push(Cell::new(CellKind::Assistant { md: s, done: false }));
                 }
                 self.cells.last_mut().unwrap().touch();
             }
@@ -600,9 +643,19 @@ impl App {
                     expanded: false,
                 }));
             }
-            AgentEvent::ToolEnd { output, is_error, detail, .. } => {
+            AgentEvent::ToolEnd {
+                output,
+                is_error,
+                detail,
+                ..
+            } => {
                 for cell in self.cells.iter_mut().rev() {
-                    if let CellKind::Tool { output: o, is_error: e, detail: d, .. } = &mut cell.kind
+                    if let CellKind::Tool {
+                        output: o,
+                        is_error: e,
+                        detail: d,
+                        ..
+                    } = &mut cell.kind
                         && e.is_none()
                     {
                         *o = output;
@@ -702,11 +755,14 @@ impl App {
             KeyCode::Enter if shift || alt || ctrl => self.editor.insert('\n'),
             KeyCode::Char('j') if ctrl => self.editor.insert('\n'),
             KeyCode::Enter => self.submit(),
-            KeyCode::Char('t') if ctrl => self.toggle_last(|k| matches!(k, CellKind::Thinking { .. })),
+            KeyCode::Char('t') if ctrl => {
+                self.toggle_last(|k| matches!(k, CellKind::Thinking { .. }))
+            }
             KeyCode::Char('o') if ctrl => self.toggle_last(|k| matches!(k, CellKind::Tool { .. })),
             KeyCode::Char('r') if ctrl => self.open_picker(),
             KeyCode::Char('l') if ctrl => {
-                self.cells.retain(|c| !matches!(c.kind, CellKind::Notice(_)));
+                self.cells
+                    .retain(|c| !matches!(c.kind, CellKind::Notice(_)));
             }
             KeyCode::Char('u') if ctrl => self.editor.kill_to_start(),
             KeyCode::Char('k') if ctrl => self.editor.kill_to_end(),
@@ -826,7 +882,11 @@ impl App {
             None => (cmd.trim(), ""),
         };
         // User-defined markdown templates.
-        let tpl = self.user_commands.iter().find(|t| format!("/{}", t.name) == head).cloned();
+        let tpl = self
+            .user_commands
+            .iter()
+            .find(|t| format!("/{}", t.name) == head)
+            .cloned();
         if let Some(t) = tpl {
             match m_core::context::expand_command(&t.path, args) {
                 Ok(prompt) => {
@@ -834,7 +894,8 @@ impl App {
                         self.steer.lock().unwrap().push_back(prompt.clone());
                         self.cells.push(Cell::new(CellKind::Queued(prompt)));
                     } else {
-                        self.cells.push(Cell::new(CellKind::User(cmd.trim().to_string())));
+                        self.cells
+                            .push(Cell::new(CellKind::User(cmd.trim().to_string())));
                         self.running = true;
                         self.cmd_tx.send(AgentCmd::Run(prompt)).ok();
                     }
@@ -976,14 +1037,23 @@ impl App {
     }
 
     fn draw_input(&mut self, f: &mut Frame, area: Rect) {
-        let border_style = if self.running { theme::dim() } else { theme::accent() };
+        let border_style = if self.running {
+            theme::dim()
+        } else {
+            theme::accent()
+        };
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(border_style);
         let inner = block.inner(area);
         f.render_widget(block, area);
-        let text: Vec<Line> = self.editor.lines().iter().map(|l| Line::raw(l.to_string())).collect();
+        let text: Vec<Line> = self
+            .editor
+            .lines()
+            .iter()
+            .map(|l| Line::raw(l.to_string()))
+            .collect();
         let nlines = text.len() as u16;
         let scroll = nlines.saturating_sub(inner.height);
         f.render_widget(Paragraph::new(text).scroll((scroll, 0)), inner);
@@ -1035,7 +1105,11 @@ impl App {
         f.render_widget(Paragraph::new(line), area);
         let rw = right.len() as u16;
         if rw < area.width {
-            let rect = Rect { x: area.x + area.width - rw, width: rw, ..area };
+            let rect = Rect {
+                x: area.x + area.width - rw,
+                width: rw,
+                ..area
+            };
             f.render_widget(Paragraph::new(Span::styled(right, theme::dim())), rect);
         }
     }
@@ -1099,10 +1173,16 @@ impl App {
             .iter()
             .enumerate()
             .map(|(i, (_, created, first))| {
-                let style =
-                    if i == p.selected { theme::accent().reversed() } else { Style::default() };
+                let style = if i == p.selected {
+                    theme::accent().reversed()
+                } else {
+                    Style::default()
+                };
                 Line::from(vec![
-                    Span::styled(format!(" {:>8} ", ago(now.saturating_sub(*created))), theme::dim()),
+                    Span::styled(
+                        format!(" {:>8} ", ago(now.saturating_sub(*created))),
+                        theme::dim(),
+                    ),
                     Span::styled(first.clone(), style),
                 ])
             })
@@ -1130,7 +1210,11 @@ fn ago(secs: u64) -> String {
     }
 }
 
-fn telemetry_of(usage: Option<Usage>, timings: Option<Timings>, prev: Option<Telemetry>) -> Telemetry {
+fn telemetry_of(
+    usage: Option<Usage>,
+    timings: Option<Timings>,
+    prev: Option<Telemetry>,
+) -> Telemetry {
     let mut t = prev.unwrap_or(Telemetry {
         prompt_tokens: 0,
         tok_per_sec: 0.0,

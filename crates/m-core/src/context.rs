@@ -66,10 +66,14 @@ pub fn discover_skills(cwd: &Path) -> Vec<SkillInfo> {
     ];
     let mut by_name: std::collections::BTreeMap<String, SkillInfo> = Default::default();
     for root in roots {
-        let Ok(entries) = std::fs::read_dir(&root) else { continue };
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            continue;
+        };
         for entry in entries.flatten() {
             let skill_md = entry.path().join("SKILL.md");
-            let Ok(head) = read_head(&skill_md, 4096) else { continue };
+            let Ok(head) = read_head(&skill_md, 4096) else {
+                continue;
+            };
             let fm = frontmatter(&head);
             let dir_name = entry.file_name().to_string_lossy().into_owned();
             let name = fm.get("name").cloned().unwrap_or(dir_name);
@@ -138,10 +142,15 @@ pub struct CommandTemplate {
 }
 
 pub fn discover_commands(cwd: &Path) -> Vec<CommandTemplate> {
-    let roots = [crate::config::config_dir().join("commands"), cwd.join(".m/commands")];
+    let roots = [
+        crate::config::config_dir().join("commands"),
+        cwd.join(".m/commands"),
+    ];
     let mut by_name: std::collections::BTreeMap<String, CommandTemplate> = Default::default();
     for root in roots {
-        let Ok(entries) = std::fs::read_dir(&root) else { continue };
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            continue;
+        };
         for entry in entries.flatten() {
             let p = entry.path();
             if p.extension().is_none_or(|e| e != "md") {
@@ -153,7 +162,11 @@ pub fn discover_commands(cwd: &Path) -> Vec<CommandTemplate> {
             let head = read_head(&p, 2048).unwrap_or_default();
             let fm = frontmatter(&head);
             let description = fm.get("description").cloned().unwrap_or_else(|| {
-                strip_frontmatter(&head).lines().next().unwrap_or("").to_string()
+                strip_frontmatter(&head)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .to_string()
             });
             by_name.insert(
                 name.clone(),
@@ -199,7 +212,10 @@ mod tests {
     fn frontmatter_parse() {
         let fm = frontmatter("---\nname: foo\ndescription: \"does things\"\n---\nbody");
         assert_eq!(fm.get("name").map(String::as_str), Some("foo"));
-        assert_eq!(fm.get("description").map(String::as_str), Some("does things"));
+        assert_eq!(
+            fm.get("description").map(String::as_str),
+            Some("does things")
+        );
         assert!(frontmatter("no fence").is_empty());
     }
 

@@ -214,10 +214,36 @@ restart — sessions are JSONL on disk, so `m -r` resumes the conversation in
 the new binary. Keep `cargo test` + a tmux TUI smoke as the gate before
 adopting a self-produced change.
 
+## CI & release
+
+Two thin GitHub Actions workflows — mechanical gates only. Agent quality
+(SWE-bench, Terminal-Bench, live TUI) stays local: CI has no model server.
+
+| workflow | trigger | does |
+|---|---|---|
+| `.github/workflows/ci.yml` | PR / push to `main` | `fmt`, `clippy -D warnings`, `test`, release build, `m --version` startup budget |
+| `.github/workflows/release.yml` | tag `v*` | assert tag == `workspace.package.version`, re-run test/clippy, ship gnu + musl `m` (+ `m-bench`) + `SHA256SUMS` |
+
+```bash
+# cut a release
+# 1. bump version in Cargo.toml (workspace.package.version)
+# 2. local checklist below
+# 3. commit, then:
+git tag v0.2.1
+git push origin v0.2.1
+```
+
+Assets: `m-x86_64-unknown-linux-gnu` (tls), `m-x86_64-unknown-linux-musl`
+(static, no tls — bench containers), `m-bench-x86_64-unknown-linux-gnu`.
+
 ## Release checklist
 
-1. `cargo test` green, `cargo clippy --all-targets` zero warnings.
-2. `M_PERF=1 m` within budget (<20ms / <30MB; expect ~0.5ms / ~7MB).
-3. tmux TUI smoke: prompt → streamed answer → Esc cancel → `/resume`.
-4. Headless smoke: `m -p "write and run a hello-world script"` in a temp dir.
-5. Bench sanity when the loop changed: 2-instance smoke + official scoring.
+Automated by CI/release on tag: test, clippy, binary build, version match.
+
+Still local (needs a human + optionally the model server):
+
+1. `M_PERF=1 m` within budget (<20ms / <30MB; expect ~0.5ms / ~7MB).
+2. tmux TUI smoke: prompt → streamed answer → Esc cancel → `/resume`.
+3. Headless smoke: `m -p "write and run a hello-world script"` in a temp dir.
+4. Bench sanity when the loop changed: 2-instance smoke + official scoring.
+5. Bump `workspace.package.version`, tag `vX.Y.Z`, push the tag.
