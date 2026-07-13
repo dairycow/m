@@ -100,10 +100,18 @@ pub struct ToolOutput {
 
 impl ToolOutput {
     fn ok(content: impl Into<String>) -> ToolOutput {
-        ToolOutput { content: content.into(), is_error: false, detail: None }
+        ToolOutput {
+            content: content.into(),
+            is_error: false,
+            detail: None,
+        }
     }
     fn err(content: impl Into<String>) -> ToolOutput {
-        ToolOutput { content: content.into(), is_error: true, detail: None }
+        ToolOutput {
+            content: content.into(),
+            is_error: true,
+            detail: None,
+        }
     }
     fn with_detail(mut self, detail: String) -> ToolOutput {
         self.detail = Some(detail);
@@ -173,12 +181,20 @@ fn str_arg<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
 
 fn resolve(path: &str, cwd: &Path) -> PathBuf {
     let p = Path::new(path);
-    if p.is_absolute() { p.to_path_buf() } else { cwd.join(p) }
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        cwd.join(p)
+    }
 }
 
 fn read_tool(args: &Value, cwd: &Path) -> Result<ToolOutput> {
     let path = resolve(str_arg(args, "path")?, cwd);
-    let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(1).max(1) as usize;
+    let offset = args
+        .get("offset")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1)
+        .max(1) as usize;
     let limit = args
         .get("limit")
         .and_then(|v| v.as_u64())
@@ -245,7 +261,10 @@ fn edit_tool(args: &Value, cwd: &Path) -> Result<ToolOutput> {
     let path = resolve(str_arg(args, "path")?, cwd);
     let old = str_arg(args, "old_string")?;
     let new = str_arg(args, "new_string")?;
-    let replace_all = args.get("replace_all").and_then(|v| v.as_bool()).unwrap_or(false);
+    let replace_all = args
+        .get("replace_all")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     if old.is_empty() {
         return Err(Error::msg("old_string must not be empty"));
     }
@@ -271,8 +290,10 @@ fn edit_tool(args: &Value, cwd: &Path) -> Result<ToolOutput> {
             let updated = text.replace(old, new);
             std::fs::write(&path, &updated)
                 .map_err(|e| Error::msg(format!("{}: {e}", path.display())))?;
-            Ok(ToolOutput::ok(format!("Edited {} ({n} replacements)", path.display()))
-                .with_detail(diff_text(&text, &updated)))
+            Ok(
+                ToolOutput::ok(format!("Edited {} ({n} replacements)", path.display()))
+                    .with_detail(diff_text(&text, &updated)),
+            )
         }
         n => Err(Error::msg(format!(
             "old_string occurs {n} times in {}. Add surrounding context to make it unique, or set replace_all=true.",
@@ -284,14 +305,25 @@ fn edit_tool(args: &Value, cwd: &Path) -> Result<ToolOutput> {
 fn skill_tool(args: &Value, skills: &[SkillInfo]) -> Result<ToolOutput> {
     let name = str_arg(args, "name")?;
     let Some(skill) = skills.iter().find(|s| s.name == name) else {
-        let available =
-            skills.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", ");
-        return Err(Error::msg(format!("no skill named '{name}' (available: {available})")));
+        let available = skills
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(Error::msg(format!(
+            "no skill named '{name}' (available: {available})"
+        )));
     };
     let text = std::fs::read_to_string(&skill.path)
         .map_err(|e| Error::msg(format!("{}: {e}", skill.path.display())))?;
-    let dir = skill.path.parent().map(|p| p.display().to_string()).unwrap_or_default();
-    Ok(ToolOutput::ok(format!("(skill '{name}', files in {dir})\n\n{text}")))
+    let dir = skill
+        .path
+        .parent()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    Ok(ToolOutput::ok(format!(
+        "(skill '{name}', files in {dir})\n\n{text}"
+    )))
 }
 
 fn bash_tool(args: &Value, cwd: &Path, cancel: &Arc<AtomicBool>) -> Result<ToolOutput> {
@@ -554,11 +586,23 @@ mod tests {
     #[test]
     fn bash_exit_codes_and_timeout() {
         let dir = tmpdir();
-        let out = execute("bash", &json!({"command": "echo hi; echo err >&2"}).to_string(), &dir, &[], &cancel());
+        let out = execute(
+            "bash",
+            &json!({"command": "echo hi; echo err >&2"}).to_string(),
+            &dir,
+            &[],
+            &cancel(),
+        );
         assert!(!out.is_error);
         assert!(out.content.contains("hi") && out.content.contains("err"));
 
-        let out = execute("bash", &json!({"command": "exit 3"}).to_string(), &dir, &[], &cancel());
+        let out = execute(
+            "bash",
+            &json!({"command": "exit 3"}).to_string(),
+            &dir,
+            &[],
+            &cancel(),
+        );
         assert!(out.is_error);
         assert!(out.content.contains("Exit code 3"));
 

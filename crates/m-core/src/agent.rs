@@ -20,12 +20,23 @@ pub enum AgentEvent {
     Reasoning(String),
     Content(String),
     /// A tool call is about to execute (arguments fully received).
-    ToolStart { name: String, args: String },
+    ToolStart {
+        name: String,
+        args: String,
+    },
     /// `detail` is UI-only extra (a diff for edit/write); not model-visible.
-    ToolEnd { name: String, output: String, is_error: bool, detail: Option<String> },
+    ToolEnd {
+        name: String,
+        output: String,
+        is_error: bool,
+        detail: Option<String>,
+    },
     /// Queued steering input was injected into the conversation.
     UserInjected(String),
-    Telemetry { usage: Option<Usage>, timings: Option<Timings> },
+    Telemetry {
+        usage: Option<Usage>,
+        timings: Option<Timings>,
+    },
     /// Non-fatal problem worth showing (retry, truncation, …).
     Notice(String),
 }
@@ -88,7 +99,13 @@ impl Agent {
         skills: Vec<SkillInfo>,
     ) -> Result<Agent> {
         let session = Session::new(&cwd, &config.profile.model)?;
-        Ok(Agent::with_session(config, cwd, system_prompt, skills, session))
+        Ok(Agent::with_session(
+            config,
+            cwd,
+            system_prompt,
+            skills,
+            session,
+        ))
     }
 
     pub fn resume(
@@ -99,7 +116,13 @@ impl Agent {
         path: &Path,
     ) -> Result<Agent> {
         let session = Session::load(path)?;
-        Ok(Agent::with_session(config, cwd, system_prompt, skills, session))
+        Ok(Agent::with_session(
+            config,
+            cwd,
+            system_prompt,
+            skills,
+            session,
+        ))
     }
 
     fn with_session(
@@ -231,7 +254,11 @@ impl Agent {
         let mut recovery = false;
         loop {
             if self.cancel.load(Ordering::Relaxed) {
-                return Ok(RunOutcome { stop: StopReason::Cancelled, final_text: String::new(), turns });
+                return Ok(RunOutcome {
+                    stop: StopReason::Cancelled,
+                    final_text: String::new(),
+                    turns,
+                });
             }
             self.guard_context(on_event);
 
@@ -282,9 +309,9 @@ impl Agent {
             // tool-specific advice for `write` — the usual culprit, since a
             // large file body can never fit under max_tokens.
             let truncated_call = completion.finish_reason == "length"
-                && tool_calls
-                    .iter()
-                    .any(|c| serde_json::from_str::<serde_json::Value>(&c.function.arguments).is_err());
+                && tool_calls.iter().any(|c| {
+                    serde_json::from_str::<serde_json::Value>(&c.function.arguments).is_err()
+                });
             if tool_calls.is_empty() || truncated_call {
                 if completion.finish_reason == "length" {
                     // Truncated mid-thought (usually a reasoning runaway on
@@ -301,10 +328,8 @@ impl Agent {
                             let name = tool_calls
                                 .iter()
                                 .find(|c| {
-                                    serde_json::from_str::<serde_json::Value>(
-                                        &c.function.arguments,
-                                    )
-                                    .is_err()
+                                    serde_json::from_str::<serde_json::Value>(&c.function.arguments)
+                                        .is_err()
                                 })
                                 .map(|c| c.function.name.as_str())
                                 .unwrap_or("tool");
@@ -360,7 +385,8 @@ impl Agent {
                 if self.cancel.load(Ordering::Relaxed) {
                     // Every issued call needs a tool result or the next
                     // request is malformed.
-                    self.session.push(Msg::tool_result(&call.id, "Cancelled by user."))?;
+                    self.session
+                        .push(Msg::tool_result(&call.id, "Cancelled by user."))?;
                     continue;
                 }
                 // Repeat detection. Deliberately NOT a blocker: an A/B on the
@@ -512,7 +538,12 @@ impl Agent {
         }
         let n = self.session.messages.len();
         let mut clipped = 0usize;
-        for msg in self.session.messages.iter_mut().take(n.saturating_sub(CTX_GUARD_KEEP_TAIL)) {
+        for msg in self
+            .session
+            .messages
+            .iter_mut()
+            .take(n.saturating_sub(CTX_GUARD_KEEP_TAIL))
+        {
             if msg.role == "tool"
                 && let Some(c) = &msg.content
                 && c.len() > 600
@@ -557,7 +588,11 @@ mod tests {
     }
 
     /// scriptable_agent return type: (agent, wire history, temperature history).
-    type ScriptedTuple = (Agent, Arc<Mutex<Vec<Vec<Msg>>>>, Arc<Mutex<Vec<Option<f32>>>>);
+    type ScriptedTuple = (
+        Agent,
+        Arc<Mutex<Vec<Vec<Msg>>>>,
+        Arc<Mutex<Vec<Option<f32>>>>,
+    );
 
     impl ChatProvider for Scripted {
         fn stream_chat(
@@ -585,19 +620,36 @@ mod tests {
     }
 
     fn completion(msg: Msg, finish_reason: &str) -> Completion {
-        Completion { msg, finish_reason: finish_reason.into(), usage: None, timings: None }
+        Completion {
+            msg,
+            finish_reason: finish_reason.into(),
+            usage: None,
+            timings: None,
+        }
     }
 
     fn done(text: &str) -> Result<Completion> {
         Ok(completion(
-            Msg { role: "assistant".into(), content: Some(text.into()), tool_calls: None, tool_call_id: None, reasoning: None },
+            Msg {
+                role: "assistant".into(),
+                content: Some(text.into()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning: None,
+            },
             "stop",
         ))
     }
 
     fn length(text: &str) -> Result<Completion> {
         Ok(completion(
-            Msg { role: "assistant".into(), content: Some(text.into()), tool_calls: None, tool_call_id: None, reasoning: None },
+            Msg {
+                role: "assistant".into(),
+                content: Some(text.into()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning: None,
+            },
             "length",
         ))
     }
@@ -609,18 +661,31 @@ mod tests {
             .map(|(i, (name, args))| ToolCall {
                 id: format!("call_{i}"),
                 kind: "function".into(),
-                function: FunctionCall { name: (*name).into(), arguments: (*args).into() },
+                function: FunctionCall {
+                    name: (*name).into(),
+                    arguments: (*args).into(),
+                },
             })
             .collect();
         Ok(completion(
-            Msg { role: "assistant".into(), content: None, tool_calls: Some(tc), tool_call_id: None, reasoning: None },
+            Msg {
+                role: "assistant".into(),
+                content: None,
+                tool_calls: Some(tc),
+                tool_call_id: None,
+                reasoning: None,
+            },
             "tool_calls",
         ))
     }
 
     fn with_usage(c: Result<Completion>, prompt_tokens: u64) -> Result<Completion> {
         c.map(|mut c| {
-            c.usage = Some(Usage { prompt_tokens, completion_tokens: 0, total_tokens: prompt_tokens });
+            c.usage = Some(Usage {
+                prompt_tokens,
+                completion_tokens: 0,
+                total_tokens: prompt_tokens,
+            });
             c
         })
     }
@@ -729,13 +794,17 @@ mod tests {
 
     #[test]
     fn length_runaway_is_discarded_and_nudged() {
-        let (mut agent, wires, _) = scripted_agent(vec![length("RUNAWAY reasoning"), done("ok")], None);
+        let (mut agent, wires, _) =
+            scripted_agent(vec![length("RUNAWAY reasoning"), done("ok")], None);
         let (outcome, _) = run(&mut agent, "go");
         assert_eq!(outcome.stop, StopReason::Done);
         // The retry wire carries the corrective nudge but not the runaway text.
         let retry_wire = &wires.lock().unwrap()[1];
-        let flat: String =
-            retry_wire.iter().filter_map(|m| m.content.clone()).collect::<Vec<_>>().join("\n");
+        let flat: String = retry_wire
+            .iter()
+            .filter_map(|m| m.content.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(flat.contains("overran the token limit"));
         assert!(!flat.contains("RUNAWAY"));
     }
@@ -753,12 +822,17 @@ mod tests {
             .iter()
             .filter(|m| {
                 m.role == "user"
-                    && m.content.as_deref().is_some_and(|c| c.contains("overran the token limit"))
+                    && m.content
+                        .as_deref()
+                        .is_some_and(|c| c.contains("overran the token limit"))
             })
             .count();
         assert_eq!(nudges, 5);
         // The final truncated answer is kept.
-        assert_eq!(agent.session.messages.last().unwrap().content.as_deref(), Some("x"));
+        assert_eq!(
+            agent.session.messages.last().unwrap().content.as_deref(),
+            Some("x")
+        );
     }
 
     #[test]
@@ -803,8 +877,9 @@ mod tests {
     #[test]
     fn truncated_tool_call_exhaustion_answers_every_call() {
         let broken = ("write", r#"{"path":"f.txt","content":"abc"#);
-        let replies =
-            (0..6).map(|_| with_finish(tool_calls(&[broken]), "length")).collect();
+        let replies = (0..6)
+            .map(|_| with_finish(tool_calls(&[broken]), "length"))
+            .collect();
         let (mut agent, _, _) = scripted_agent(replies, None);
         let (outcome, _) = run(&mut agent, "go");
         assert_eq!(outcome.stop, StopReason::Length);
@@ -818,8 +893,10 @@ mod tests {
     #[test]
     fn repeated_identical_call_gets_escalating_note() {
         let echo = ("bash", r#"{"command":"echo stable"}"#);
-        let (mut agent, _, _) =
-            scripted_agent(vec![tool_calls(&[echo]), tool_calls(&[echo]), done("ok")], None);
+        let (mut agent, _, _) = scripted_agent(
+            vec![tool_calls(&[echo]), tool_calls(&[echo]), done("ok")],
+            None,
+        );
         let (outcome, _) = run(&mut agent, "go");
         assert_eq!(outcome.stop, StopReason::Done);
         let results = tool_results(&agent);
@@ -833,7 +910,12 @@ mod tests {
         let echo = ("bash", r#"{"command":"echo stable"}"#);
         let write = ("write", r#"{"path":"f.txt","content":"x"}"#);
         let (mut agent, _, _) = scripted_agent(
-            vec![tool_calls(&[echo]), tool_calls(&[write]), tool_calls(&[echo]), done("ok")],
+            vec![
+                tool_calls(&[echo]),
+                tool_calls(&[write]),
+                tool_calls(&[echo]),
+                done("ok"),
+            ],
             None,
         );
         let (outcome, _) = run(&mut agent, "go");
@@ -847,8 +929,7 @@ mod tests {
     #[test]
     fn cancel_mid_turn_still_answers_every_tool_call() {
         let echo = ("bash", r#"{"command":"echo hi"}"#);
-        let (mut agent, _, _) =
-            scripted_agent(vec![tool_calls(&[echo, echo])], Some(1));
+        let (mut agent, _, _) = scripted_agent(vec![tool_calls(&[echo, echo])], Some(1));
         let (outcome, _) = run(&mut agent, "go");
         assert_eq!(outcome.stop, StopReason::Cancelled);
         let results = tool_results(&agent);
@@ -882,11 +963,18 @@ mod tests {
             .iter()
             .filter(|e| matches!(e, AgentEvent::Notice(n) if n.contains("turn budget warning")))
             .collect();
-        assert_eq!(warnings.len(), 1, "expected 1 warning, got {}: {warnings:?}", warnings.len());
+        assert_eq!(
+            warnings.len(),
+            1,
+            "expected 1 warning, got {}: {warnings:?}",
+            warnings.len()
+        );
         // The user message is in the session.
         assert!(agent.session.messages.iter().any(|m| {
             m.role == "user"
-                && m.content.as_deref().is_some_and(|c| c.contains("4 turns remain"))
+                && m.content
+                    .as_deref()
+                    .is_some_and(|c| c.contains("4 turns remain"))
         }));
     }
 
@@ -896,21 +984,32 @@ mod tests {
         // No max_turns → no budget warning, ever. With a done() at the
         // end to cleanly exit the loop.
         let (mut agent, _, _) = scripted_agent(
-            vec![tool_calls(&[echo]), tool_calls(&[echo]), tool_calls(&[echo]), done("ok")],
+            vec![
+                tool_calls(&[echo]),
+                tool_calls(&[echo]),
+                tool_calls(&[echo]),
+                done("ok"),
+            ],
             None,
         );
         agent.config.max_turns = 0;
         let (_, events) = run(&mut agent, "go");
-        assert!(!events.iter().any(
-            |e| matches!(e, AgentEvent::Notice(n) if n.contains("turn budget warning"))
-        ));
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Notice(n) if n.contains("turn budget warning")))
+        );
     }
 
     #[test]
     fn steering_input_is_injected_after_tools() {
         let echo = ("bash", r#"{"command":"echo hi"}"#);
         let (mut agent, wires, _) = scripted_agent(vec![tool_calls(&[echo]), done("ok")], None);
-        agent.steer.lock().unwrap().push_back("also check the docs".into());
+        agent
+            .steer
+            .lock()
+            .unwrap()
+            .push_back("also check the docs".into());
         let (outcome, _) = run(&mut agent, "go");
         assert_eq!(outcome.stop, StopReason::Done);
         let retry_wire = &wires.lock().unwrap()[1];
@@ -932,8 +1031,10 @@ mod tests {
 
     #[test]
     fn api_error_is_not_retried() {
-        let (mut agent, wires, _) =
-            scripted_agent(vec![Err(Error::msg("API error (HTTP 400): bad request"))], None);
+        let (mut agent, wires, _) = scripted_agent(
+            vec![Err(Error::msg("API error (HTTP 400): bad request"))],
+            None,
+        );
         let err = agent.run_prompt("go", &mut |_| {}).unwrap_err();
         assert!(err.to_string().contains("API error"));
         assert_eq!(wires.lock().unwrap().len(), 1);
@@ -942,36 +1043,48 @@ mod tests {
     #[test]
     fn context_guard_clips_memory_not_session_file() {
         let echo = ("bash", r#"{"command":"echo hi"}"#);
-        let (mut agent, _, _) = scripted_agent(
-            vec![with_usage(tool_calls(&[echo]), 900), done("ok")],
-            None,
-        );
+        let (mut agent, _, _) =
+            scripted_agent(vec![with_usage(tool_calls(&[echo]), 900), done("ok")], None);
         agent.ctx_limit_handle().store(1000, Ordering::Relaxed);
         let long = "y".repeat(700);
         for i in 0..12 {
-            agent.session.push(Msg::tool_result(&format!("old_{i}"), &long)).unwrap();
+            agent
+                .session
+                .push(Msg::tool_result(&format!("old_{i}"), &long))
+                .unwrap();
         }
         let (outcome, events) = run(&mut agent, "go");
         assert_eq!(outcome.stop, StopReason::Done);
-        assert!(events.iter().any(
-            |e| matches!(e, AgentEvent::Notice(n) if n.contains("clipped"))
-        ));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Notice(n) if n.contains("clipped")))
+        );
         let clipped_in_memory = agent
             .session
             .messages
             .iter()
-            .filter(|m| m.content.as_deref().is_some_and(|c| c.contains("clipped to fit context")))
+            .filter(|m| {
+                m.content
+                    .as_deref()
+                    .is_some_and(|c| c.contains("clipped to fit context"))
+            })
             .count();
         assert!(clipped_in_memory > 0);
         // The session file stays faithful.
         let reloaded = Session::load(&agent.session.path).unwrap();
+        assert!(reloaded.messages.iter().all(|m| {
+            !m.content
+                .as_deref()
+                .unwrap_or("")
+                .contains("clipped to fit context")
+        }));
         assert!(
             reloaded
                 .messages
                 .iter()
-                .all(|m| !m.content.as_deref().unwrap_or("").contains("clipped to fit context"))
+                .any(|m| m.content.as_deref() == Some(long.as_str()))
         );
-        assert!(reloaded.messages.iter().any(|m| m.content.as_deref() == Some(long.as_str())));
     }
 
     #[test]
@@ -991,7 +1104,12 @@ mod tests {
         let echo = ("bash", r#"{"command":"echo hi"}"#);
         // 3 identical tool calls with identical output → third triggers recovery
         let (mut agent, _, temps) = scripted_agent(
-            vec![tool_calls(&[echo]), tool_calls(&[echo]), tool_calls(&[echo]), done("ok")],
+            vec![
+                tool_calls(&[echo]),
+                tool_calls(&[echo]),
+                tool_calls(&[echo]),
+                done("ok"),
+            ],
             None,
         );
         agent.config.profile.temperature = Some(0.0);
@@ -999,7 +1117,11 @@ mod tests {
         assert_eq!(outcome.stop, StopReason::Done);
         let t: Vec<_> = temps.lock().unwrap().clone();
         // 4 calls to the model: normal, normal, annotated-repeat→recovery, recovery (final answer)
-        assert_eq!(t, vec![Some(0.0), Some(0.0), Some(0.4), Some(0.4)], "temps: {t:?}");
+        assert_eq!(
+            t,
+            vec![Some(0.0), Some(0.0), Some(0.4), Some(0.4)],
+            "temps: {t:?}"
+        );
     }
 
     #[test]

@@ -21,7 +21,10 @@ fn assets() -> &'static Assets {
     ASSETS.get_or_init(|| {
         let syntaxes = SyntaxSet::load_defaults_newlines();
         let mut themes = ThemeSet::load_defaults();
-        let theme = themes.themes.remove("base16-eighties.dark").unwrap_or_default();
+        let theme = themes
+            .themes
+            .remove("base16-eighties.dark")
+            .unwrap_or_default();
         Assets { syntaxes, theme }
     })
 }
@@ -46,7 +49,10 @@ pub fn highlight(code: &str, lang: &str) -> Vec<Line<'static>> {
     let syntax = a
         .syntaxes
         .find_syntax_by_token(lang)
-        .or_else(|| a.syntaxes.find_syntax_by_first_line(code.lines().next().unwrap_or("")))
+        .or_else(|| {
+            a.syntaxes
+                .find_syntax_by_first_line(code.lines().next().unwrap_or(""))
+        })
         .unwrap_or_else(|| a.syntaxes.find_syntax_plain_text());
     let mut h = HighlightLines::new(syntax, &a.theme);
     let mut out = Vec::new();

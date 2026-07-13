@@ -32,7 +32,9 @@ impl Url {
         } else if let Some(r) = s.strip_prefix("http://") {
             (false, r)
         } else {
-            return Err(Error::msg(format!("URL must start with http:// or https://: {s}")));
+            return Err(Error::msg(format!(
+                "URL must start with http:// or https://: {s}"
+            )));
         };
         let (authority, path) = match rest.find('/') {
             Some(i) => (&rest[..i], &rest[i..]),
@@ -41,14 +43,20 @@ impl Url {
         let (host, port) = match authority.rsplit_once(':') {
             Some((h, p)) => (
                 h.to_string(),
-                p.parse::<u16>().map_err(|_| Error::msg(format!("bad port in URL: {s}")))?,
+                p.parse::<u16>()
+                    .map_err(|_| Error::msg(format!("bad port in URL: {s}")))?,
             ),
             None => (authority.to_string(), if https { 443 } else { 80 }),
         };
         if host.is_empty() {
             return Err(Error::msg(format!("no host in URL: {s}")));
         }
-        Ok(Url { https, host, port, path: path.to_string() })
+        Ok(Url {
+            https,
+            host,
+            port,
+            path: path.to_string(),
+        })
     }
 
     /// Join a base URL (scheme://host[:port][/prefix]) with a path.
@@ -158,7 +166,9 @@ fn connect(url: &Url) -> Result<Transport> {
                 .map_err(|_| Error::msg(format!("invalid TLS server name: {}", url.host)))?;
             let conn = rustls::ClientConnection::new(tls_config(), name)
                 .map_err(|e| Error::msg(format!("TLS setup: {e}")))?;
-            Ok(Transport::Tls(Box::new(rustls::StreamOwned::new(conn, tcp))))
+            Ok(Transport::Tls(Box::new(rustls::StreamOwned::new(
+                conn, tcp,
+            ))))
         }
         #[cfg(not(feature = "tls"))]
         {
@@ -184,8 +194,13 @@ pub struct Response {
 #[derive(Debug)]
 enum BodyKind {
     /// Chunked transfer-encoding; `remaining` = bytes left in current chunk.
-    Chunked { remaining: usize, done: bool },
-    Length { remaining: usize },
+    Chunked {
+        remaining: usize,
+        done: bool,
+    },
+    Length {
+        remaining: usize,
+    },
     /// Read until EOF (Connection: close).
     Eof,
 }
@@ -209,7 +224,8 @@ pub fn post_json(
     req.push_str(&format!("Content-Length: {}\r\n\r\n", body.len()));
     write_all_retry(&mut t, req.as_bytes(), &cancel)?;
     write_all_retry(&mut t, body, &cancel)?;
-    t.flush().map_err(|e| Error::msg(format!("send request: {e}")))?;
+    t.flush()
+        .map_err(|e| Error::msg(format!("send request: {e}")))?;
     read_response_head(t, cancel)
 }
 
@@ -230,7 +246,10 @@ fn write_all_retry(t: &mut Transport, mut buf: &[u8], cancel: &AtomicBool) -> Re
 }
 
 fn retryable(e: &std::io::Error) -> bool {
-    matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted)
+    matches!(
+        e.kind(),
+        ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
+    )
 }
 
 fn read_response_head(mut t: Transport, cancel: Arc<AtomicBool>) -> Result<Response> {
@@ -275,14 +294,25 @@ fn read_response_head(mut t: Transport, cancel: Arc<AtomicBool>) -> Result<Respo
     }
 
     let body = if header(&headers, "transfer-encoding").is_some_and(|v| v.contains("chunked")) {
-        BodyKind::Chunked { remaining: 0, done: false }
+        BodyKind::Chunked {
+            remaining: 0,
+            done: false,
+        }
     } else if let Some(len) = header(&headers, "content-length").and_then(|v| v.parse().ok()) {
         BodyKind::Length { remaining: len }
     } else {
         BodyKind::Eof
     };
 
-    Ok(Response { status, headers, transport: t, buf, pos, body, cancel })
+    Ok(Response {
+        status,
+        headers,
+        transport: t,
+        buf,
+        pos,
+        body,
+        cancel,
+    })
 }
 
 fn find_header_end(buf: &[u8]) -> Option<usize> {
@@ -290,7 +320,10 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
 }
 
 fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
-    headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
+    headers
+        .iter()
+        .find(|(k, _)| k == name)
+        .map(|(_, v)| v.as_str())
 }
 
 impl Response {
@@ -381,16 +414,25 @@ impl Response {
                             ParseChunk::NeedMore => {
                                 if self.fill()? == 0 {
                                     // Truncated stream; treat as end.
-                                    self.body = BodyKind::Chunked { remaining: 0, done: true };
+                                    self.body = BodyKind::Chunked {
+                                        remaining: 0,
+                                        done: true,
+                                    };
                                     return Ok(0);
                                 }
                             }
                             ParseChunk::Size(0) => {
-                                self.body = BodyKind::Chunked { remaining: 0, done: true };
+                                self.body = BodyKind::Chunked {
+                                    remaining: 0,
+                                    done: true,
+                                };
                                 return Ok(0);
                             }
                             ParseChunk::Size(n) => {
-                                self.body = BodyKind::Chunked { remaining: n, done: false };
+                                self.body = BodyKind::Chunked {
+                                    remaining: n,
+                                    done: false,
+                                };
                             }
                         }
                     } else {
@@ -498,7 +540,11 @@ pub fn get_json(url: &Url, headers: &[(&str, &str)], cancel: Arc<AtomicBool>) ->
     let mut resp = read_response_head(t, cancel)?;
     let body = resp.read_to_string()?;
     if resp.status >= 400 {
-        return Err(Error::msg(format!("HTTP {}: {}", resp.status, truncate(&body, 300))));
+        return Err(Error::msg(format!(
+            "HTTP {}: {}",
+            resp.status,
+            truncate(&body, 300)
+        )));
     }
     Ok(body)
 }
@@ -523,7 +569,10 @@ mod tests {
     fn parse_urls() {
         let u = Url::parse("http://localhost:8080").unwrap();
         assert!(!u.https);
-        assert_eq!((u.host.as_str(), u.port, u.path.as_str()), ("localhost", 8080, "/"));
+        assert_eq!(
+            (u.host.as_str(), u.port, u.path.as_str()),
+            ("localhost", 8080, "/")
+        );
         let u = Url::parse("https://api.example.com/v1").unwrap();
         assert!(u.https);
         assert_eq!((u.port, u.path.as_str()), (443, "/v1"));
