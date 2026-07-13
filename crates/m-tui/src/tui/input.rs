@@ -154,6 +154,30 @@ impl Editor {
         (row, before[col_start..].width())
     }
 
+    /// `@`-mention token immediately before the cursor: an `@` preceded by
+    /// start-of-text or whitespace, followed by zero or more non-whitespace
+    /// characters up to the cursor. Returns (byte offset of `@`, query
+    /// text). Cursor-relative, unlike a whole-buffer prefix check — an `@`
+    /// can open a mention anywhere in the line, not just at position 0.
+    pub fn mention(&self) -> Option<(usize, &str)> {
+        let before = &self.text[..self.cursor];
+        let at = before.rfind('@')?;
+        let query = &before[at + 1..];
+        if query.chars().any(char::is_whitespace) {
+            return None;
+        }
+        let starts_ok =
+            at == 0 || before[..at].chars().next_back().is_some_and(char::is_whitespace);
+        starts_ok.then_some((at, query))
+    }
+
+    /// Replace the mention token (`start`..cursor) with `replacement`,
+    /// leaving the cursor just after it.
+    pub fn complete_mention(&mut self, start: usize, replacement: &str) {
+        self.text.replace_range(start..self.cursor, replacement);
+        self.cursor = start + replacement.len();
+    }
+
     pub fn lines(&self) -> Vec<&str> {
         if self.text.is_empty() {
             vec![""]
@@ -254,5 +278,53 @@ mod tests {
         assert_eq!(e.cursor_rc(), (0, 0));
         e.end();
         assert_eq!(e.cursor_rc(), (0, 2));
+    }
+
+    #[test]
+    fn mention_at_buffer_start() {
+        let mut e = Editor::default();
+        e.insert_str("@foo");
+        assert_eq!(e.mention(), Some((0, "foo")));
+    }
+
+    #[test]
+    fn mention_after_space_mid_sentence() {
+        let mut e = Editor::default();
+        e.insert_str("hello @wor");
+        assert_eq!(e.mention(), Some((6, "wor")));
+    }
+
+    #[test]
+    fn no_preceding_whitespace_does_not_trigger() {
+        let mut e = Editor::default();
+        e.insert_str("foo@bar");
+        assert_eq!(e.mention(), None);
+    }
+
+    #[test]
+    fn space_after_query_breaks_the_mention() {
+        let mut e = Editor::default();
+        e.insert_str("@foo bar");
+        assert_eq!(e.mention(), None);
+    }
+
+    #[test]
+    fn mention_ignores_text_after_cursor() {
+        let mut e = Editor::default();
+        e.insert_str("@foobar");
+        e.left();
+        e.left();
+        e.left();
+        assert_eq!(e.mention(), Some((0, "foo")));
+    }
+
+    #[test]
+    fn complete_mention_splices_and_closes_the_popup() {
+        let mut e = Editor::default();
+        e.insert_str("see @fo");
+        let (start, _) = e.mention().unwrap();
+        e.complete_mention(start, "@foo/bar.rs ");
+        assert_eq!(e.text(), "see @foo/bar.rs ");
+        assert_eq!(e.mention(), None);
     }
 }

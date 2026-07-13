@@ -2,6 +2,8 @@
 //! thread and streams AgentEvents over a channel. Draws only when dirty,
 //! coalescing stream events per frame.
 
+mod files;
+mod fuzzy;
 mod hl;
 mod input;
 mod md;
@@ -46,6 +48,7 @@ enum UiMsg {
     SessionInfo { id: String, path: PathBuf, cells: Vec<CellKind> },
     RebuildDone(Result<(), String>),
     ProfileSwitched { name: String, model: String },
+    AtFiles(Vec<String>),
 }
 
 // ---------------------------------------------------------------- cells
@@ -268,6 +271,15 @@ pub struct App {
     /// A background `/rebuild` finished; swap into the new binary as soon
     /// as the agent isn't mid-turn.
     reload_pending: bool,
+    /// Cached project file listing for the `@` picker, refreshed on every
+    /// fresh `@` keystroke.
+    at_files: Arc<[String]>,
+    /// A listing thread is in flight (drives the "loading files…" popup).
+    at_loading: bool,
+    at_sel: usize,
+    /// Byte offset of an `@` the user Esc'd; keeps that mention's popup
+    /// closed until it's retyped.
+    at_dismissed_at: Option<usize>,
 }
 
 pub fn run_tui(
@@ -324,6 +336,10 @@ pub fn run_tui(
         leader_x: None,
         want_editor: false,
         reload_pending: false,
+        at_files: Arc::from([]),
+        at_loading: false,
+        at_sel: 0,
+        at_dismissed_at: None,
     };
     if app.cells.is_empty() {
         app.cells.push(Cell::new(CellKind::Notice(format!(
@@ -726,6 +742,10 @@ impl App {
                 self.notice(format!("switched to profile '{name}' ({model})"));
                 self.profile_name = name;
             }
+            UiMsg::AtFiles(files) => {
+                self.at_files = files.into();
+                self.at_loading = false;
+            }
         }
     }
 
@@ -890,6 +910,9 @@ impl App {
                 }
             }
             KeyCode::Char('d') if ctrl && self.editor.is_empty() => self.quit = true,
+            KeyCode::Esc if self.at_open() => {
+                self.at_dismissed_at = self.editor.mention().map(|(start, _)| start);
+            }
             KeyCode::Esc => {
                 if self.running {
                     self.cancel.store(true, Ordering::SeqCst);
@@ -898,6 +921,7 @@ impl App {
                 }
             }
             KeyCode::Enter if shift || alt || ctrl => self.editor.insert('\n'),
+            KeyCode::Enter if self.editor.mention().is_some() => self.at_complete(),
             KeyCode::Char('j') if ctrl => self.editor.insert('\n'),
             KeyCode::Enter => self.submit(),
             KeyCode::Char('t') if ctrl => {
@@ -928,6 +952,8 @@ impl App {
             KeyCode::Up => {
                 if self.slash_active() {
                     self.slash_sel = self.slash_sel.saturating_sub(1);
+                } else if self.editor.mention().is_some() {
+                    self.at_sel = self.at_sel.saturating_sub(1);
                 } else {
                     self.editor.up();
                 }
@@ -935,6 +961,8 @@ impl App {
             KeyCode::Down => {
                 if self.slash_active() {
                     self.slash_sel += 1;
+                } else if self.editor.mention().is_some() {
+                    self.at_sel += 1;
                 } else {
                     self.editor.down();
                 }
@@ -942,10 +970,17 @@ impl App {
             KeyCode::PageUp => self.scroll_up += 10,
             KeyCode::PageDown => self.scroll_up = self.scroll_up.saturating_sub(10),
             KeyCode::Tab if self.slash_active() => self.slash_complete(),
+            KeyCode::Tab if self.editor.mention().is_some() => self.at_complete(),
             KeyCode::Char(c) if !ctrl && !alt => {
                 self.editor.insert(c);
                 if c == '/' || self.slash_active() {
                     self.slash_sel = 0;
+                }
+                if c == '@' {
+                    self.spawn_at_listing();
+                }
+                if self.editor.mention().is_some() {
+                    self.at_sel = 0;
                 }
             }
             _ => {}
@@ -1076,6 +1111,47 @@ impl App {
         out
     }
 
+    /// Refresh the project file listing in the background; called on every
+    /// literal `@` keystroke rather than per filter-keystroke, since
+    /// filtering itself is a pure in-memory pass over `at_files`.
+    fn spawn_at_listing(&mut self) {
+        self.at_loading = true;
+        let cwd = self.cwd.clone();
+        let tx = self.ui_tx.clone();
+        std::thread::spawn(move || {
+            tx.send(UiMsg::AtFiles(files::list_project_files(&cwd))).ok();
+        });
+    }
+
+    /// Whether the `@`-mention popup should be showing right now.
+    fn at_open(&self) -> bool {
+        matches!(self.editor.mention(), Some((start, _)) if self.at_dismissed_at != Some(start))
+    }
+
+    fn at_matches(&self) -> Vec<(String, i64)> {
+        let Some((_, query)) = self.editor.mention() else { return Vec::new() };
+        let mut out: Vec<(String, i64)> = self
+            .at_files
+            .iter()
+            .filter_map(|f| fuzzy::score(f, query).map(|s| (f.clone(), s)))
+            .collect();
+        out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.len().cmp(&b.0.len())));
+        out.truncate(20);
+        out
+    }
+
+    /// Insert the selected match as `@relative/path ` (trailing space).
+    /// That trailing space naturally closes the popup on the next frame —
+    /// `Editor::mention` sees whitespace in the query and returns `None` —
+    /// so there's no separate "close" step needed.
+    fn at_complete(&mut self) {
+        let Some((start, _)) = self.editor.mention() else { return };
+        let matches = self.at_matches();
+        if let Some((path, _)) = matches.get(self.at_sel.min(matches.len().saturating_sub(1))) {
+            self.editor.complete_mention(start, &format!("@{path} "));
+        }
+    }
+
     fn slash_complete(&mut self) {
         let matches = self.slash_matches();
         if let Some((cmd, _)) = matches.get(self.slash_sel.min(matches.len().saturating_sub(1))) {
@@ -1144,7 +1220,7 @@ impl App {
                 self.notice(
                     "enter send · shift/alt+enter newline · esc cancel · ctrl+c ×2 quit · \
                      ctrl+o expand tool · ctrl+t expand thinking · ctrl+r sessions · \
-                     ctrl+x ctrl+e edit in $EDITOR · \
+                     ctrl+x ctrl+e edit in $EDITOR · @ file picker · \
                      pgup/pgdn or wheel scroll · \
                      /new /resume /compact /model /reload /rebuild /quit",
                 );
@@ -1252,7 +1328,9 @@ impl App {
         self.draw_transcript(f, transcript_area);
         self.draw_input(f, input_area);
         self.draw_status(f, status_area);
-        if self.slash_active() {
+        if self.at_open() {
+            self.draw_at_menu(f, input_area);
+        } else if self.slash_active() {
             self.draw_slash_menu(f, input_area);
         }
         if self.picker.is_some() {
@@ -1410,6 +1488,46 @@ impl App {
                 ])
             })
             .collect();
+        f.render_widget(Clear, area);
+        f.render_widget(
+            Paragraph::new(lines).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(theme::dim()),
+            ),
+            area,
+        );
+    }
+
+    fn draw_at_menu(&mut self, f: &mut Frame, input_area: Rect) {
+        let matches = self.at_matches();
+        self.at_sel = self.at_sel.min(matches.len().saturating_sub(1));
+        let loading = self.at_loading && self.at_files.is_empty();
+        let h = matches.len().max(1) as u16 + 2;
+        let area = Rect {
+            x: input_area.x + 2,
+            y: input_area.y.saturating_sub(h),
+            width: 60.min(f.area().width.saturating_sub(4)),
+            height: h,
+        };
+        let lines: Vec<Line> = if matches.is_empty() {
+            let msg = if loading { "loading files…" } else { "no matches" };
+            vec![Line::styled(format!(" {msg}"), theme::dim())]
+        } else {
+            matches
+                .iter()
+                .enumerate()
+                .map(|(i, (path, _))| {
+                    let style = if i == self.at_sel {
+                        theme::accent().reversed()
+                    } else {
+                        Style::default()
+                    };
+                    Line::styled(format!(" {path}"), style)
+                })
+                .collect()
+        };
         f.render_widget(Clear, area);
         f.render_widget(
             Paragraph::new(lines).block(
