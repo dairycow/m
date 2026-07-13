@@ -84,7 +84,12 @@ impl Profile {
     /// Resolve the bearer token: `api_key_cmd` (if set) → env-expanded `api_key`.
     /// Returns empty string when the key is missing or the sentinel `"none"`.
     pub fn resolve_api_key(&self) -> Result<String> {
-        if let Some(cmd) = self.api_key_cmd.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+        if let Some(cmd) = self
+            .api_key_cmd
+            .as_deref()
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+        {
             let out = Command::new("sh")
                 .arg("-c")
                 .arg(cmd)
@@ -140,10 +145,11 @@ fn expand_env(s: &str) -> String {
     if let Some(name) = s.strip_prefix("${").and_then(|r| r.strip_suffix('}')) {
         return std::env::var(name).unwrap_or_default();
     }
-    if let Some(name) = s.strip_prefix('$') {
-        if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-            return std::env::var(name).unwrap_or_default();
-        }
+    if let Some(name) = s.strip_prefix('$')
+        && !name.is_empty()
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return std::env::var(name).unwrap_or_default();
     }
     s.to_string()
 }
@@ -167,8 +173,7 @@ impl ConfigFile {
 
     /// Profile names known to this file, always including built-in `local`.
     fn profile_names(&self) -> Vec<String> {
-        let mut names: std::collections::BTreeSet<String> =
-            self.profiles.keys().cloned().collect();
+        let mut names: std::collections::BTreeSet<String> = self.profiles.keys().cloned().collect();
         names.insert("local".to_string());
         names.into_iter().collect()
     }
@@ -258,10 +263,7 @@ pub fn load(profile: Option<&str>) -> Result<Config> {
 
 /// Split `provider` or `provider/model…` against the known provider names.
 /// Longest-prefix wins so `or/qwen/qwen3-coder` → (`or`, `qwen/qwen3-coder`).
-pub fn split_provider_model(
-    raw: &str,
-    providers: &[String],
-) -> Result<(String, Option<String>)> {
+pub fn split_provider_model(raw: &str, providers: &[String]) -> Result<(String, Option<String>)> {
     let raw = raw.trim();
     if raw.is_empty() {
         return Err(Error::msg("empty provider/model spec"));
@@ -273,10 +275,10 @@ pub fn split_provider_model(
             return Ok((n.clone(), None));
         }
         let prefix = format!("{n}/");
-        if let Some(model) = raw.strip_prefix(&prefix) {
-            if !model.is_empty() {
-                return Ok((n.clone(), Some(model.to_string())));
-            }
+        if let Some(model) = raw.strip_prefix(&prefix)
+            && !model.is_empty()
+        {
+            return Ok((n.clone(), Some(model.to_string())));
         }
     }
     Err(Error::msg(format!(
@@ -336,7 +338,14 @@ pub fn resolve_model_spec(
         let b = b.trim();
         if !b.is_empty() && providers.iter().any(|p| p == a) {
             let prof = file.get_profile(a)?;
-            return Ok((a.to_string(), if b.is_empty() { prof.model } else { b.to_string() }));
+            return Ok((
+                a.to_string(),
+                if b.is_empty() {
+                    prof.model
+                } else {
+                    b.to_string()
+                },
+            ));
         }
     }
 
@@ -358,17 +367,15 @@ pub fn resolve_model_spec(
 
     let mut hits: Vec<(String, String)> = Vec::new();
     for name in &providers {
-        if let Ok(prof) = file.get_profile(name) {
-            if prof.available_models().iter().any(|m| m == spec) {
-                hits.push((name.clone(), spec.to_string()));
-            }
+        if let Ok(prof) = file.get_profile(name)
+            && prof.available_models().iter().any(|m| m == spec)
+        {
+            hits.push((name.clone(), spec.to_string()));
         }
     }
     match hits.len() {
         1 => Ok(hits.pop().unwrap()),
-        0 if current.models.is_empty() => {
-            Ok((current_provider.to_string(), spec.to_string()))
-        }
+        0 if current.models.is_empty() => Ok((current_provider.to_string(), spec.to_string())),
         0 => Err(Error::msg(format!(
             "unknown model '{spec}' — /model for the catalog, or /model <provider>/<model>"
         ))),
@@ -415,12 +422,18 @@ mod tests {
 
     #[test]
     fn available_models_includes_default() {
-        let mut p = Profile::default();
-        p.model = "glm-5.2".into();
-        p.models = vec!["glm-5-turbo".into(), "glm-4.5-air".into()];
+        let p = Profile {
+            model: "glm-5.2".into(),
+            models: vec!["glm-5-turbo".into(), "glm-4.5-air".into()],
+            ..Default::default()
+        };
         assert_eq!(
             p.available_models(),
-            vec!["glm-5.2".to_string(), "glm-5-turbo".into(), "glm-4.5-air".into()]
+            vec![
+                "glm-5.2".to_string(),
+                "glm-5-turbo".into(),
+                "glm-4.5-air".into()
+            ]
         );
     }
 }

@@ -23,7 +23,13 @@ pub fn list_project_files(cwd: &Path) -> Vec<String> {
 /// separated) so filenames containing spaces/newlines parse correctly.
 fn git_ls_files(cwd: &Path) -> Option<Vec<String>> {
     let out = std::process::Command::new("git")
-        .args(["ls-files", "-z", "--cached", "--others", "--exclude-standard"])
+        .args([
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ])
         .current_dir(cwd)
         .output()
         .ok()?;
@@ -46,7 +52,9 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<String>, depth: usize) {
     if depth > MAX_DEPTH || out.len() >= MAX_FILES {
         return;
     }
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         if out.len() >= MAX_FILES {
             return;
@@ -57,7 +65,9 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<String>, depth: usize) {
         if name.starts_with('.') || IGNORED_DIRS.contains(&name.as_ref()) {
             continue;
         }
-        let Ok(file_type) = entry.file_type() else { continue };
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
         if file_type.is_dir() {
             walk(root, &path, out, depth + 1);
         } else if file_type.is_file()
@@ -74,8 +84,7 @@ mod tests {
     use std::fs;
 
     fn tmp_dir(name: &str) -> std::path::PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("m-files-test-{name}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("m-files-test-{name}-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         dir
     }

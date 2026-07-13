@@ -46,9 +46,16 @@ enum UiMsg {
     Ev(AgentEvent),
     RunDone(StopReason),
     RunErr(String),
-    SessionInfo { id: String, path: PathBuf, cells: Vec<CellKind> },
+    SessionInfo {
+        id: String,
+        path: PathBuf,
+        cells: Vec<CellKind>,
+    },
     RebuildDone(Result<(), String>),
-    ProfileSwitched { name: String, model: String },
+    ProfileSwitched {
+        name: String,
+        model: String,
+    },
     AtFiles(Vec<String>),
 }
 
@@ -223,9 +230,18 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/resume", "pick a previous session"),
     ("/compact", "summarize the session to free context"),
     ("/skills", "list discovered skills"),
-    ("/model", "list or switch provider/model (e.g. zai-coding-plan/glm-5.2)"),
-    ("/reload", "hot-reload the running binary, keeping this session"),
-    ("/rebuild", "cargo build+test --release in the background, then hot-reload"),
+    (
+        "/model",
+        "list or switch provider/model (e.g. zai-coding-plan/glm-5.2)",
+    ),
+    (
+        "/reload",
+        "hot-reload the running binary, keeping this session",
+    ),
+    (
+        "/rebuild",
+        "cargo build+test --release in the background, then hot-reload",
+    ),
     ("/quit", "exit m"),
 ];
 
@@ -723,12 +739,13 @@ fn spawn_agent_thread(
                 }
                 AgentCmd::NewSession => match agent.new_session() {
                     Ok(()) => {
-                        ui_tx.send(UiMsg::SessionInfo {
-                            id: agent.session.id.clone(),
-                            path: agent.session.path.clone(),
-                            cells: vec![CellKind::Notice("new session".into())],
-                        })
-                        .ok();
+                        ui_tx
+                            .send(UiMsg::SessionInfo {
+                                id: agent.session.id.clone(),
+                                path: agent.session.path.clone(),
+                                cells: vec![CellKind::Notice("new session".into())],
+                            })
+                            .ok();
                     }
                     Err(e) => {
                         ui_tx.send(UiMsg::RunErr(e.to_string())).ok();
@@ -757,14 +774,15 @@ fn spawn_agent_thread(
                     };
                     match agent.compact(&mut on_event) {
                         Ok(()) => {
-                            ui_tx.send(UiMsg::SessionInfo {
-                                id: agent.session.id.clone(),
-                                path: agent.session.path.clone(),
-                                cells: vec![CellKind::Notice(
-                                    "session compacted into a fresh context".into(),
-                                )],
-                            })
-                            .ok();
+                            ui_tx
+                                .send(UiMsg::SessionInfo {
+                                    id: agent.session.id.clone(),
+                                    path: agent.session.path.clone(),
+                                    cells: vec![CellKind::Notice(
+                                        "session compacted into a fresh context".into(),
+                                    )],
+                                })
+                                .ok();
                         }
                         Err(e) => {
                             ui_tx.send(UiMsg::RunErr(e.to_string())).ok();
@@ -1235,7 +1253,10 @@ impl App {
         let args: Vec<&str> = parts.collect();
 
         restore_terminal(kitty);
-        let result = std::process::Command::new(prog).args(&args).arg(&path).status();
+        let result = std::process::Command::new(prog)
+            .args(&args)
+            .arg(&path)
+            .status();
         enter_terminal(kitty).ok();
         terminal.clear().ok();
 
@@ -1360,7 +1381,8 @@ impl App {
         let cwd = self.cwd.clone();
         let tx = self.ui_tx.clone();
         std::thread::spawn(move || {
-            tx.send(UiMsg::AtFiles(files::list_project_files(&cwd))).ok();
+            tx.send(UiMsg::AtFiles(files::list_project_files(&cwd)))
+                .ok();
         });
     }
 
@@ -1370,7 +1392,9 @@ impl App {
     }
 
     fn at_matches(&self) -> Vec<(String, i64)> {
-        let Some((_, query)) = self.editor.mention() else { return Vec::new() };
+        let Some((_, query)) = self.editor.mention() else {
+            return Vec::new();
+        };
         let mut out: Vec<(String, i64)> = self
             .at_files
             .iter()
@@ -1386,7 +1410,9 @@ impl App {
     /// `Editor::mention` sees whitespace in the query and returns `None` —
     /// so there's no separate "close" step needed.
     fn at_complete(&mut self) {
-        let Some((start, _)) = self.editor.mention() else { return };
+        let Some((start, _)) = self.editor.mention() else {
+            return;
+        };
         let matches = self.at_matches();
         if let Some((path, _)) = matches.get(self.at_sel.min(matches.len().saturating_sub(1))) {
             self.editor.complete_mention(start, &format!("@{path} "));
@@ -1512,7 +1538,9 @@ impl App {
                 } else if self.running {
                     self.notice("busy — esc to cancel first");
                 } else {
-                    self.cmd_tx.send(AgentCmd::SwitchProfile(args.to_string())).ok();
+                    self.cmd_tx
+                        .send(AgentCmd::SwitchProfile(args.to_string()))
+                        .ok();
                 }
             }
             "/reload" => {
@@ -1631,13 +1659,20 @@ impl App {
     }
 
     fn draw_input(&mut self, f: &mut Frame, area: Rect) {
-        let border_style = if self.running { theme::dim() } else { theme::accent() };
+        let border_style = if self.running {
+            theme::dim()
+        } else {
+            theme::accent()
+        };
         let mut block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(border_style);
         if self.leader_x.is_some() {
-            block = block.title(Span::styled(" ctrl+x ctrl+e: edit in $EDITOR ", theme::dim()));
+            block = block.title(Span::styled(
+                " ctrl+x ctrl+e: edit in $EDITOR ",
+                theme::dim(),
+            ));
         }
         let inner = block.inner(area);
         f.render_widget(block, area);
@@ -1759,7 +1794,11 @@ impl App {
             height: h,
         };
         let lines: Vec<Line> = if matches.is_empty() {
-            let msg = if loading { "loading files…" } else { "no matches" };
+            let msg = if loading {
+                "loading files…"
+            } else {
+                "no matches"
+            };
             vec![Line::styled(format!(" {msg}"), theme::dim())]
         } else {
             matches
@@ -1903,29 +1942,53 @@ mod leader_tests {
 
     #[test]
     fn ctrl_x_arms_the_leader() {
-        assert_eq!(leader_step(false, true, KeyCode::Char('x')), LeaderOutcome::Armed);
+        assert_eq!(
+            leader_step(false, true, KeyCode::Char('x')),
+            LeaderOutcome::Armed
+        );
     }
 
     #[test]
     fn plain_x_does_not_arm() {
-        assert_eq!(leader_step(false, false, KeyCode::Char('x')), LeaderOutcome::Pass);
+        assert_eq!(
+            leader_step(false, false, KeyCode::Char('x')),
+            LeaderOutcome::Pass
+        );
     }
 
     #[test]
     fn e_after_leader_opens_editor_ctrl_or_not() {
-        assert_eq!(leader_step(true, false, KeyCode::Char('e')), LeaderOutcome::OpenEditor);
-        assert_eq!(leader_step(true, true, KeyCode::Char('e')), LeaderOutcome::OpenEditor);
-        assert_eq!(leader_step(true, false, KeyCode::Char('E')), LeaderOutcome::OpenEditor);
+        assert_eq!(
+            leader_step(true, false, KeyCode::Char('e')),
+            LeaderOutcome::OpenEditor
+        );
+        assert_eq!(
+            leader_step(true, true, KeyCode::Char('e')),
+            LeaderOutcome::OpenEditor
+        );
+        assert_eq!(
+            leader_step(true, false, KeyCode::Char('E')),
+            LeaderOutcome::OpenEditor
+        );
     }
 
     #[test]
     fn other_key_after_leader_passes_through_instead_of_opening() {
-        assert_eq!(leader_step(true, false, KeyCode::Char('q')), LeaderOutcome::Pass);
-        assert_eq!(leader_step(true, true, KeyCode::Char('c')), LeaderOutcome::Pass);
+        assert_eq!(
+            leader_step(true, false, KeyCode::Char('q')),
+            LeaderOutcome::Pass
+        );
+        assert_eq!(
+            leader_step(true, true, KeyCode::Char('c')),
+            LeaderOutcome::Pass
+        );
     }
 
     #[test]
     fn second_ctrl_x_while_not_pending_rearms() {
-        assert_eq!(leader_step(false, true, KeyCode::Char('x')), LeaderOutcome::Armed);
+        assert_eq!(
+            leader_step(false, true, KeyCode::Char('x')),
+            LeaderOutcome::Armed
+        );
     }
 }

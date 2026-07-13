@@ -185,7 +185,8 @@ impl Agent {
         new_cfg.profile.model = model;
         self.config.profile_name = new_cfg.profile_name;
         self.config.profile = new_cfg.profile;
-        self.ctx_limit.store(self.config.profile.ctx, Ordering::Relaxed);
+        self.ctx_limit
+            .store(self.config.profile.ctx, Ordering::Relaxed);
         if endpoint_changed {
             spawn_ctx_probe(&self.ctx_limit, &self.config.profile);
         }

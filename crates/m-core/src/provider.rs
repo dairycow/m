@@ -244,8 +244,10 @@ pub fn stream_chat(
     }
 
     let header_owned = profile.request_headers()?;
-    let headers: Vec<(&str, &str)> =
-        header_owned.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let headers: Vec<(&str, &str)> = header_owned
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
     let body_bytes = serde_json::to_vec(&body)?;
     let mut resp = http::post_json(&url, &headers, &body_bytes, cancel)?;
 
@@ -402,11 +404,23 @@ mod tests {
     #[test]
     fn chat_path_respects_versioned_bases() {
         assert_eq!(chat_path("http://localhost:8080"), "/v1/chat/completions");
-        assert_eq!(chat_path("https://openrouter.ai/api/v1"), "/chat/completions");
-        assert_eq!(chat_path("https://openrouter.ai/api/v1/"), "/chat/completions");
-        assert_eq!(chat_path("https://api.z.ai/api/coding/paas/v4/"), "/chat/completions");
+        assert_eq!(
+            chat_path("https://openrouter.ai/api/v1"),
+            "/chat/completions"
+        );
+        assert_eq!(
+            chat_path("https://openrouter.ai/api/v1/"),
+            "/chat/completions"
+        );
+        assert_eq!(
+            chat_path("https://api.z.ai/api/coding/paas/v4/"),
+            "/chat/completions"
+        );
         assert_eq!(chat_path("https://api.x.ai/v1"), "/chat/completions");
-        assert_eq!(chat_path("https://cli-chat-proxy.grok.com/v1"), "/chat/completions");
+        assert_eq!(
+            chat_path("https://cli-chat-proxy.grok.com/v1"),
+            "/chat/completions"
+        );
         // "v" followed by non-digits is not a version segment.
         assert_eq!(
             chat_path("https://example.com/api/vein"),
