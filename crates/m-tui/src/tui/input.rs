@@ -166,8 +166,11 @@ impl Editor {
         if query.chars().any(char::is_whitespace) {
             return None;
         }
-        let starts_ok =
-            at == 0 || before[..at].chars().next_back().is_some_and(char::is_whitespace);
+        let starts_ok = at == 0
+            || before[..at]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_whitespace);
         starts_ok.then_some((at, query))
     }
 
