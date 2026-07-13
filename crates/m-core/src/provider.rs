@@ -243,12 +243,11 @@ pub fn stream_chat(
         body["max_tokens"] = json!(m);
     }
 
-    let auth = format!("Bearer {}", profile.api_key);
-    let headers: Vec<(&str, &str)> = if profile.api_key.is_empty() {
-        vec![]
-    } else {
-        vec![("Authorization", &auth)]
-    };
+    let header_owned = profile.request_headers()?;
+    let headers: Vec<(&str, &str)> = header_owned
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
     let body_bytes = serde_json::to_vec(&body)?;
     let mut resp = http::post_json(&url, &headers, &body_bytes, cancel)?;
 
@@ -415,6 +414,11 @@ mod tests {
         );
         assert_eq!(
             chat_path("https://api.z.ai/api/coding/paas/v4/"),
+            "/chat/completions"
+        );
+        assert_eq!(chat_path("https://api.x.ai/v1"), "/chat/completions");
+        assert_eq!(
+            chat_path("https://cli-chat-proxy.grok.com/v1"),
             "/chat/completions"
         );
         // "v" followed by non-digits is not a version segment.

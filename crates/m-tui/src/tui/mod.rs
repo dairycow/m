@@ -2,12 +2,15 @@
 //! thread and streams AgentEvents over a channel. Draws only when dirty,
 //! coalescing stream events per frame.
 
+mod files;
+mod fuzzy;
 mod hl;
 mod input;
 mod md;
 mod theme;
 
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
@@ -36,13 +39,24 @@ enum AgentCmd {
     NewSession,
     LoadSession(PathBuf),
     Compact,
+    SwitchProfile(String),
 }
 
 enum UiMsg {
     Ev(AgentEvent),
     RunDone(StopReason),
     RunErr(String),
-    SessionInfo { id: String, cells: Vec<CellKind> },
+    SessionInfo {
+        id: String,
+        path: PathBuf,
+        cells: Vec<CellKind>,
+    },
+    RebuildDone(Result<(), String>),
+    ProfileSwitched {
+        name: String,
+        model: String,
+    },
+    AtFiles(Vec<String>),
 }
 
 // ---------------------------------------------------------------- cells
@@ -216,6 +230,18 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/resume", "pick a previous session"),
     ("/compact", "summarize the session to free context"),
     ("/skills", "list discovered skills"),
+    (
+        "/model",
+        "list or switch provider/model (e.g. zai-coding-plan/glm-5.2)",
+    ),
+    (
+        "/reload",
+        "hot-reload the running binary, keeping this session",
+    ),
+    (
+        "/rebuild",
+        "cargo build+test --release in the background, then hot-reload",
+    ),
     ("/quit", "exit m"),
 ];
 
@@ -239,8 +265,13 @@ pub struct App {
     steer: Arc<Mutex<std::collections::VecDeque<String>>>,
     cmd_tx: mpsc::Sender<AgentCmd>,
     ui_rx: mpsc::Receiver<UiMsg>,
+    /// A second sender handle so background jobs we spawn ourselves (e.g.
+    /// `/rebuild`) can report back without going through the agent thread.
+    ui_tx: mpsc::Sender<UiMsg>,
     profile_label: String,
+    profile_name: String,
     session_id: String,
+    session_path: PathBuf,
     n_skills: usize,
     user_commands: Vec<m_core::context::CommandTemplate>,
     picker: Option<Picker>,
@@ -249,6 +280,25 @@ pub struct App {
     cwd: PathBuf,
     dirty: bool,
     quit: bool,
+    /// Set right after `ctrl+x` while we wait for the completing `e`.
+    leader_x: Option<Instant>,
+    /// Set by `on_key` when the `ctrl+x ctrl+e` sequence completes; the
+    /// event loop notices this and suspends the TUI to run `$EDITOR`.
+    want_editor: bool,
+    /// A background `/rebuild` finished; swap into the new binary as soon
+    /// as the agent isn't mid-turn.
+    reload_pending: bool,
+    /// Cached project file listing for the `@` picker, refreshed on every
+    /// fresh `@` keystroke.
+    at_files: Arc<[String]>,
+    /// A listing thread is in flight (drives the "loading files…" popup).
+    at_loading: bool,
+    at_sel: usize,
+    /// Byte offset of an `@` the user Esc'd; keeps that mention's popup
+    /// closed until it's retyped.
+    at_dismissed_at: Option<usize>,
+    /// Kitty keyboard-enhancement protocol active (for restore /reload).
+    kitty: bool,
 }
 
 pub fn run_tui(
@@ -276,6 +326,7 @@ pub fn run_tui(
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<AgentCmd>();
     let (ui_tx, ui_rx) = mpsc::channel::<UiMsg>();
+    let app_ui_tx = ui_tx.clone();
 
     let mut app = App {
         cells: session_cells(&agent.session),
@@ -288,8 +339,11 @@ pub fn run_tui(
         steer: agent.steer.clone(),
         cmd_tx,
         ui_rx,
+        ui_tx: app_ui_tx,
         profile_label: format!("{}/{}", cfg.profile_name, cfg.profile.model),
+        profile_name: cfg.profile_name.clone(),
         session_id: agent.session.id.clone(),
+        session_path: agent.session.path.clone(),
         n_skills,
         user_commands,
         picker: None,
@@ -298,6 +352,14 @@ pub fn run_tui(
         cwd: cwd.clone(),
         dirty: true,
         quit: false,
+        leader_x: None,
+        want_editor: false,
+        reload_pending: false,
+        at_files: Arc::from([]),
+        at_loading: false,
+        at_sel: 0,
+        at_dismissed_at: None,
+        kitty: false, // set once enhancement probe completes
     };
     if app.cells.is_empty() {
         app.cells.push(Cell::new(CellKind::Notice(format!(
@@ -309,8 +371,21 @@ pub fn run_tui(
 
     spawn_agent_thread(agent, cmd_rx, ui_tx);
 
-    // Terminal setup with restore-on-panic.
+    // Snapshot cooked termios *before* raw mode so signal handlers can put
+    // the shell back even when Drop/panic hooks don't run (SIGTERM, etc.).
+    // Without this, a killed TUI leaves the tty with ECHO/ICANON off — the
+    // classic "commands work but typed text is invisible" failure mode.
+    save_cooked_termios();
+
+    // Terminal setup. `TerminalGuard` restores on every exit path (Ok, Err,
+    // panic); signal handlers cover hard kills that skip unwinding.
+    //
+    // Install emergency signal handlers *before* the kitty probe: that
+    // query blocks up to ~2s, and a SIGTERM in the window used to leave
+    // the shell raw with no restore path.
     crossterm::terminal::enable_raw_mode()?;
+    install_emergency_signal_handlers();
+    mark_tui_active(false);
     let mut out = std::io::stdout();
     crossterm::execute!(
         out,
@@ -326,21 +401,25 @@ pub fn run_tui(
             )
         )?;
     }
-    let default_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        restore_terminal(kitty);
-        default_hook(info);
-    }));
+    mark_tui_active(kitty);
+    install_panic_hook(kitty);
+    app.kitty = kitty;
+    let mut guard = TerminalGuard { kitty, armed: true };
 
     let mut terminal = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
+    // A fresh Terminal's diff buffer starts blank, so it may skip cells it
+    // thinks are already empty. After a `/reload` exec() the physical
+    // screen can still hold the old process's leftover frame — force a
+    // full repaint so the first draw doesn't leave stale content behind.
+    terminal.clear()?;
     let perf = std::env::var("M_PERF").is_ok();
     let mut first_frame: Option<(Duration, u64)> = None;
     if perf {
         terminal.draw(|f| app.draw(f))?;
         first_frame = Some((t0.elapsed(), rss_kb()));
     }
-    let res = app.event_loop(&mut terminal);
-    restore_terminal(kitty);
+    let res = app.event_loop(&mut terminal, kitty);
+    guard.restore();
     if let Some((ttff, rss)) = first_frame {
         eprintln!(
             "m: first frame {:.1}ms · rss {:.1}MB",
@@ -363,18 +442,276 @@ fn rss_kb() -> u64 {
         .unwrap_or(0)
 }
 
-fn restore_terminal(kitty: bool) {
-    let mut out = std::io::stdout();
-    if kitty {
-        crossterm::execute!(out, event::PopKeyboardEnhancementFlags).ok();
+// ---------------------------------------------------------------- terminal lifecycle
+//
+// Leaving raw mode / alternate screen is the difference between a usable
+// shell and one that accepts keystrokes but paints nothing (ECHO off).
+// Restore is therefore best-effort, idempotent, and reachable from Drop,
+// the panic hook, signal handlers, and the `/reload` exec path.
+
+/// TUI currently owns the tty (raw + alt screen). Cleared by restore.
+static TUI_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Kitty keyboard progressive-enhancement stack was pushed.
+static KITTY_PUSHED: AtomicBool = AtomicBool::new(false);
+/// `SAVED_TERMIOS` holds a pre-raw snapshot suitable for signal-safe restore.
+static TERMIOS_SAVED: AtomicBool = AtomicBool::new(false);
+
+// Written once on the main thread before signals are installed; read from
+// signal handlers afterwards. Access is synchronized by TERMIOS_SAVED + the
+// single-threaded install-before-use pattern.
+static mut SAVED_TERMIOS: libc::termios = unsafe { std::mem::zeroed() };
+
+fn save_cooked_termios() {
+    unsafe {
+        let mut t: libc::termios = std::mem::zeroed();
+        // stdin is the controlling tty in interactive use; match crossterm.
+        if libc::tcgetattr(libc::STDIN_FILENO, &mut t) == 0 {
+            // If we were re-exec'd without a prior restore (or started under
+            // another raw-mode program), the snapshot is already raw. Treat
+            // that as unusable and force a sane cooked baseline so quit can
+            // never "restore" to invisible-echo mode.
+            ensure_cooked_flags(&mut t);
+            SAVED_TERMIOS = t;
+            TERMIOS_SAVED.store(true, Ordering::SeqCst);
+        }
     }
+}
+
+/// Turn on the line-discipline flags an interactive shell needs. Idempotent
+/// on an already-cooked termios; repairs a raw one into something usable.
+fn ensure_cooked_flags(t: &mut libc::termios) {
+    // Input: map CR→NL, allow XON/XOFF; drop raw-style stripping.
+    t.c_iflag |= libc::BRKINT | libc::ICRNL | libc::IMAXBEL | libc::IXON;
+    t.c_iflag &= !(libc::IGNBRK | libc::INLCR | libc::IGNCR | libc::IXOFF);
+    // Output: post-process NL→CRNL so shell output is visible line-by-line.
+    t.c_oflag |= libc::OPOST | libc::ONLCR;
+    // Local: canonical line editing + echo + signals. This is the whole fix
+    // for "commands work but typed text is invisible".
+    t.c_lflag |= libc::ISIG | libc::ICANON | libc::IEXTEN | libc::ECHO | libc::ECHOE | libc::ECHOK;
+    t.c_lflag &= !(libc::ECHONL);
+    // Non-canonical VMIN/VTIME are irrelevant once ICANON is on, but leave
+    // cc[] as whatever the host had so erase/kill chars stay familiar.
+}
+
+fn mark_tui_active(kitty: bool) {
+    TUI_ACTIVE.store(true, Ordering::SeqCst);
+    KITTY_PUSHED.store(kitty, Ordering::SeqCst);
+}
+
+/// RAII: always put the terminal back when the TUI scope ends.
+struct TerminalGuard {
+    kitty: bool,
+    armed: bool,
+}
+
+impl TerminalGuard {
+    /// Restore now and disarm so Drop is a no-op (e.g. before `exec`).
+    fn restore(&mut self) {
+        if self.armed {
+            restore_terminal(self.kitty);
+            self.armed = false;
+        }
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            restore_terminal(self.kitty);
+            self.armed = false;
+        }
+    }
+}
+
+fn install_panic_hook(kitty: bool) {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore_terminal(kitty);
+        default_hook(info);
+    }));
+}
+
+fn install_emergency_signal_handlers() {
+    // SIGINT is normally masked by raw mode (ISIG off) for in-band ctrl+c
+    // handling, but external `kill -INT` / SIGHUP / SIGTERM / SIGQUIT still
+    // arrive and would otherwise exit without restoring the tty.
+    unsafe {
+        let f: extern "C" fn(libc::c_int) = emergency_terminal_restore;
+        let handler = f as usize;
+        libc::signal(libc::SIGTERM, handler);
+        libc::signal(libc::SIGHUP, handler);
+        libc::signal(libc::SIGINT, handler);
+        libc::signal(libc::SIGQUIT, handler);
+    }
+}
+
+/// Async-signal-safe-ish emergency restore. Uses only `write` + `tcsetattr`
+/// + `_exit` — not crossterm (locks / alloc).
+extern "C" fn emergency_terminal_restore(sig: libc::c_int) {
+    // Always try; TUI_ACTIVE just avoids a second pass if Drop already ran.
+    TUI_ACTIVE.store(false, Ordering::SeqCst);
+    // CSI sequences: pop kitty kbd, disable mouse (all modes crossterm enables),
+    // leave alt screen, show cursor, reset SGR, reset scroll region.
+    // PopKeyboardEnhancementFlags == CSI < 1 u
+    const SEQ: &[u8] = b"\x1b[<1u\x1b[?1006l\x1b[?1015l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?1049l\x1b[?25h\x1b[0m\x1b[r";
+    unsafe {
+        libc::write(libc::STDOUT_FILENO, SEQ.as_ptr() as *const _, SEQ.len());
+        // Background jobs get SIGTTOU on tcsetattr to the controlling tty;
+        // ignore it so the restore still lands.
+        libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+        // Prefer /dev/tty when present: stdin may be a pipe in odd launchers,
+        // while the line discipline we raw'd lives on the controlling tty.
+        let mut fd = libc::STDIN_FILENO;
+        let tty = libc::open(c"/dev/tty".as_ptr(), libc::O_RDWR | libc::O_NOCTTY);
+        if tty >= 0 {
+            fd = tty;
+        }
+        if TERMIOS_SAVED.load(Ordering::SeqCst) {
+            let rc = libc::tcsetattr(fd, libc::TCSANOW, std::ptr::addr_of!(SAVED_TERMIOS));
+            if rc != 0 {
+                // Snapshot missing or rejected — synthesize cooked flags on the live attrs.
+                let mut t: libc::termios = std::mem::zeroed();
+                if libc::tcgetattr(fd, &mut t) == 0 {
+                    // Inline the critical bits (no call into non-async-safe code).
+                    t.c_iflag |= libc::BRKINT | libc::ICRNL | libc::IMAXBEL | libc::IXON;
+                    t.c_oflag |= libc::OPOST | libc::ONLCR;
+                    t.c_lflag |= libc::ISIG
+                        | libc::ICANON
+                        | libc::IEXTEN
+                        | libc::ECHO
+                        | libc::ECHOE
+                        | libc::ECHOK;
+                    libc::tcsetattr(fd, libc::TCSANOW, &t);
+                }
+            }
+        } else {
+            let mut t: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(fd, &mut t) == 0 {
+                t.c_iflag |= libc::BRKINT | libc::ICRNL | libc::IMAXBEL | libc::IXON;
+                t.c_oflag |= libc::OPOST | libc::ONLCR;
+                t.c_lflag |= libc::ISIG
+                    | libc::ICANON
+                    | libc::IEXTEN
+                    | libc::ECHO
+                    | libc::ECHOE
+                    | libc::ECHOK;
+                libc::tcsetattr(fd, libc::TCSANOW, &t);
+            }
+        }
+        if tty >= 0 {
+            libc::close(tty);
+        }
+        libc::_exit(128 + sig);
+    }
+}
+
+fn restore_terminal(kitty: bool) {
+    TUI_ACTIVE.store(false, Ordering::SeqCst);
+    let mut out = std::io::stdout();
+    let pop_kitty = kitty || KITTY_PUSHED.load(Ordering::SeqCst);
+    if pop_kitty {
+        crossterm::execute!(out, event::PopKeyboardEnhancementFlags).ok();
+        KITTY_PUSHED.store(false, Ordering::SeqCst);
+    }
+    // Show cursor + reset colors: ratatui may have left the cursor hidden or
+    // an SGR attribute active if we tear down mid-frame.
     crossterm::execute!(
         out,
         event::DisableMouseCapture,
-        crossterm::terminal::LeaveAlternateScreen
+        crossterm::terminal::LeaveAlternateScreen,
+        crossterm::cursor::Show,
+        crossterm::style::ResetColor,
     )
     .ok();
+    // Reset scrolling region (DECSTBM) in case a partial draw left it set.
+    let _ = out.write_all(b"\x1b[r");
+    let _ = out.flush();
     crossterm::terminal::disable_raw_mode().ok();
+    // Final authority: apply our pre-raw snapshot (with cooked flags forced
+    // on). Crossterm alone is not enough after `/reload` exec, because the
+    // replacement process would have saved raw mode as its "original".
+    force_cooked_termios();
+}
+
+fn force_cooked_termios() {
+    unsafe {
+        libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+        // Prefer the controlling tty over stdin: they diverge when stdin is
+        // redirected, and background restores need /dev/tty to avoid SIGTTOU
+        // weirdness with the process-group line discipline.
+        let tty = libc::open(c"/dev/tty".as_ptr(), libc::O_RDWR | libc::O_NOCTTY);
+        let fd = if tty >= 0 { tty } else { libc::STDIN_FILENO };
+
+        let ok = if TERMIOS_SAVED.load(Ordering::SeqCst) {
+            libc::tcsetattr(fd, libc::TCSANOW, std::ptr::addr_of!(SAVED_TERMIOS)) == 0
+        } else {
+            false
+        };
+        if !ok {
+            let mut t: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(fd, &mut t) == 0 {
+                ensure_cooked_flags(&mut t);
+                let _ = libc::tcsetattr(fd, libc::TCSANOW, &t);
+            }
+        }
+        if tty >= 0 {
+            libc::close(tty);
+        }
+    }
+}
+
+/// Re-enter the TUI's raw/alternate-screen mode after [`restore_terminal`]
+/// suspended it for a child process (e.g. `$EDITOR`).
+fn enter_terminal(kitty: bool) -> std::io::Result<()> {
+    crossterm::terminal::enable_raw_mode()?;
+    let mut out = std::io::stdout();
+    crossterm::execute!(
+        out,
+        crossterm::terminal::EnterAlternateScreen,
+        event::EnableMouseCapture
+    )?;
+    if kitty {
+        crossterm::execute!(
+            out,
+            event::PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+            )
+        )?;
+    }
+    mark_tui_active(kitty);
+    Ok(())
+}
+
+/// Where `cargo build --release` puts this binary in the workspace this
+/// copy of `m` was built from, derived from `CARGO_MANIFEST_DIR`
+/// (`.../crates/m-tui`) rather than any runtime lookup.
+fn release_binary_path() -> Option<PathBuf> {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace_root = manifest_dir.parent()?.parent()?;
+    Some(workspace_root.join("target/release/m"))
+}
+
+/// Run `cargo <args>` in `cwd`, capturing rather than inheriting its
+/// stdout/stderr (the caller is a background thread while the TUI owns the
+/// terminal). On failure, `label` names the step in the error message.
+fn run_cargo_step(cwd: &Path, args: &[&str], label: &str) -> Result<(), String> {
+    let result = std::process::Command::new("cargo")
+        .args(args)
+        .current_dir(cwd)
+        .stdout(std::process::Stdio::null())
+        .output();
+    match result {
+        Ok(out) if out.status.success() => Ok(()),
+        Ok(out) => {
+            let last_line = String::from_utf8_lossy(&out.stderr)
+                .lines()
+                .next_back()
+                .unwrap_or("no output")
+                .to_string();
+            Err(format!("{label} failed: {last_line}"))
+        }
+        Err(e) => Err(format!("failed to run cargo {label}: {e}")),
+    }
 }
 
 fn spawn_agent_thread(
@@ -405,6 +742,7 @@ fn spawn_agent_thread(
                         ui_tx
                             .send(UiMsg::SessionInfo {
                                 id: agent.session.id.clone(),
+                                path: agent.session.path.clone(),
                                 cells: vec![CellKind::Notice("new session".into())],
                             })
                             .ok();
@@ -419,6 +757,7 @@ fn spawn_agent_thread(
                         ui_tx
                             .send(UiMsg::SessionInfo {
                                 id: agent.session.id.clone(),
+                                path: agent.session.path.clone(),
                                 cells,
                             })
                             .ok();
@@ -438,6 +777,7 @@ fn spawn_agent_thread(
                             ui_tx
                                 .send(UiMsg::SessionInfo {
                                     id: agent.session.id.clone(),
+                                    path: agent.session.path.clone(),
                                     cells: vec![CellKind::Notice(
                                         "session compacted into a fresh context".into(),
                                     )],
@@ -449,6 +789,19 @@ fn spawn_agent_thread(
                         }
                     }
                 }
+                AgentCmd::SwitchProfile(name) => match agent.switch_profile(&name) {
+                    Ok(()) => {
+                        ui_tx
+                            .send(UiMsg::ProfileSwitched {
+                                name: agent.config.profile_name.clone(),
+                                model: agent.config.profile.model.clone(),
+                            })
+                            .ok();
+                    }
+                    Err(e) => {
+                        ui_tx.send(UiMsg::RunErr(e.to_string())).ok();
+                    }
+                },
             }
         }
     });
@@ -526,6 +879,7 @@ impl App {
     fn event_loop(
         &mut self,
         terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+        kitty: bool,
     ) -> std::io::Result<()> {
         let frame_budget = Duration::from_millis(16);
         let mut last_draw = Instant::now() - frame_budget;
@@ -537,7 +891,13 @@ impl App {
             // Input.
             if event::poll(Duration::from_millis(if self.running { 33 } else { 250 }))? {
                 match event::read()? {
-                    Event::Key(k) if k.kind != KeyEventKind::Release => self.on_key(k),
+                    Event::Key(k) if k.kind != KeyEventKind::Release => {
+                        self.on_key(k);
+                        if self.want_editor {
+                            self.want_editor = false;
+                            self.open_external_editor(terminal, kitty);
+                        }
+                    }
                     Event::Mouse(me) => match me.kind {
                         MouseEventKind::ScrollUp => {
                             self.scroll_up += 3;
@@ -556,6 +916,18 @@ impl App {
                     }
                     _ => {}
                 }
+            }
+            // Clear a stale "ctrl+x" leader hint nobody completed.
+            if let Some(t) = self.leader_x
+                && t.elapsed() >= Duration::from_millis(1500)
+            {
+                self.leader_x = None;
+                self.dirty = true;
+            }
+            // A background rebuild finished; hot-reload as soon as we're idle.
+            if self.reload_pending && !self.running {
+                self.reload_pending = false;
+                self.reload();
             }
             // Spinner animation while running.
             if self.running && last_draw.elapsed() >= Duration::from_millis(120) {
@@ -591,12 +963,32 @@ impl App {
                 self.finalize_open_cells();
                 self.cells.push(Cell::new(CellKind::ErrorCell(e)));
             }
-            UiMsg::SessionInfo { id, cells } => {
+            UiMsg::SessionInfo { id, path, cells } => {
                 self.running = false;
                 self.session_id = id;
+                self.session_path = path;
                 self.cells = cells.into_iter().map(Cell::new).collect();
                 self.telemetry = None;
                 self.scroll_up = 0;
+            }
+            UiMsg::RebuildDone(Ok(())) => {
+                self.notice("rebuild done — reloading…");
+                self.reload_pending = true;
+            }
+            UiMsg::RebuildDone(Err(e)) => self.notice(format!("rebuild failed: {e}")),
+            UiMsg::ProfileSwitched { name, model } => {
+                let label = format!("{name}/{model}");
+                if self.profile_label == label {
+                    self.notice(format!("already on {label}"));
+                } else {
+                    self.profile_label = label.clone();
+                    self.profile_name = name;
+                    self.notice(format!("switched to {label}"));
+                }
+            }
+            UiMsg::AtFiles(files) => {
+                self.at_files = files.into();
+                self.at_loading = false;
             }
         }
     }
@@ -729,6 +1121,23 @@ impl App {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         let alt = k.modifiers.contains(KeyModifiers::ALT);
         let shift = k.modifiers.contains(KeyModifiers::SHIFT);
+
+        let leader_pending = match self.leader_x.take() {
+            Some(t) => t.elapsed() < Duration::from_millis(1500),
+            None => false,
+        };
+        match leader_step(leader_pending, ctrl, k.code) {
+            LeaderOutcome::Armed => {
+                self.leader_x = Some(Instant::now());
+                return;
+            }
+            LeaderOutcome::OpenEditor => {
+                self.want_editor = true;
+                return;
+            }
+            LeaderOutcome::Pass => {}
+        }
+
         match k.code {
             KeyCode::Char('c') if ctrl => {
                 if self.running {
@@ -745,6 +1154,9 @@ impl App {
                 }
             }
             KeyCode::Char('d') if ctrl && self.editor.is_empty() => self.quit = true,
+            KeyCode::Esc if self.at_open() => {
+                self.at_dismissed_at = self.editor.mention().map(|(start, _)| start);
+            }
             KeyCode::Esc => {
                 if self.running {
                     self.cancel.store(true, Ordering::SeqCst);
@@ -753,6 +1165,7 @@ impl App {
                 }
             }
             KeyCode::Enter if shift || alt || ctrl => self.editor.insert('\n'),
+            KeyCode::Enter if self.editor.mention().is_some() => self.at_complete(),
             KeyCode::Char('j') if ctrl => self.editor.insert('\n'),
             KeyCode::Enter => self.submit(),
             KeyCode::Char('t') if ctrl => {
@@ -776,11 +1189,15 @@ impl App {
             KeyCode::Right if alt || ctrl => self.editor.word_right(),
             KeyCode::Left => self.editor.left(),
             KeyCode::Right => self.editor.right(),
-            KeyCode::Home => self.editor.home(),
-            KeyCode::End => self.editor.end(),
+            // Jump the transcript to the very top/bottom (ctrl+a/ctrl+e
+            // above cover start/end of the current input line).
+            KeyCode::Home => self.scroll_up = usize::MAX,
+            KeyCode::End => self.scroll_up = 0,
             KeyCode::Up => {
                 if self.slash_active() {
                     self.slash_sel = self.slash_sel.saturating_sub(1);
+                } else if self.editor.mention().is_some() {
+                    self.at_sel = self.at_sel.saturating_sub(1);
                 } else {
                     self.editor.up();
                 }
@@ -788,6 +1205,8 @@ impl App {
             KeyCode::Down => {
                 if self.slash_active() {
                     self.slash_sel += 1;
+                } else if self.editor.mention().is_some() {
+                    self.at_sel += 1;
                 } else {
                     self.editor.down();
                 }
@@ -795,14 +1214,127 @@ impl App {
             KeyCode::PageUp => self.scroll_up += 10,
             KeyCode::PageDown => self.scroll_up = self.scroll_up.saturating_sub(10),
             KeyCode::Tab if self.slash_active() => self.slash_complete(),
+            KeyCode::Tab if self.editor.mention().is_some() => self.at_complete(),
             KeyCode::Char(c) if !ctrl && !alt => {
                 self.editor.insert(c);
                 if c == '/' || self.slash_active() {
                     self.slash_sel = 0;
                 }
+                if c == '@' {
+                    self.spawn_at_listing();
+                }
+                if self.editor.mention().is_some() {
+                    self.at_sel = 0;
+                }
             }
             _ => {}
         }
+    }
+
+    /// Suspend the TUI, edit the current input in `$VISUAL`/`$EDITOR`
+    /// (falling back to `vi`), and load the result back on a clean exit.
+    fn open_external_editor(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+        kitty: bool,
+    ) {
+        let path = std::env::temp_dir().join(format!("m-input-{}.md", std::process::id()));
+        if std::fs::write(&path, self.editor.text()).is_err() {
+            return;
+        }
+        let editor_cmd = std::env::var("VISUAL")
+            .or_else(|_| std::env::var("EDITOR"))
+            .unwrap_or_else(|_| "vi".to_string());
+        let mut parts = editor_cmd.split_whitespace();
+        let Some(prog) = parts.next() else {
+            std::fs::remove_file(&path).ok();
+            return;
+        };
+        let args: Vec<&str> = parts.collect();
+
+        restore_terminal(kitty);
+        let result = std::process::Command::new(prog)
+            .args(&args)
+            .arg(&path)
+            .status();
+        enter_terminal(kitty).ok();
+        terminal.clear().ok();
+
+        match result {
+            Ok(status) if status.success() => {
+                if let Ok(new_text) = std::fs::read_to_string(&path) {
+                    self.editor.set(new_text.trim_end_matches('\n'));
+                }
+            }
+            Ok(_) => {} // editor exited non-zero (e.g. `:cq`): keep the original input
+            Err(e) => self.notice(format!("failed to launch editor '{prog}': {e}")),
+        }
+        std::fs::remove_file(&path).ok();
+        self.dirty = true;
+    }
+
+    /// Hot-reload: re-exec the freshly built binary in place, resuming this
+    /// exact session. On success this never returns (the process image is
+    /// replaced).
+    ///
+    /// Deliberately *not* `std::env::current_exe()`: `cargo build --release`
+    /// replaces `target/release/m` by rename, and on Linux `/proc/self/exe`
+    /// keeps pointing at the old, now-unlinked inode — `current_exe()`
+    /// reports it as `<path> (deleted)` and exec fails. `release_binary_path`
+    /// is a plain path computed from the workspace this copy was built
+    /// from, so the exec looks up whatever is *currently* linked there.
+    ///
+    /// Restores the tty *before* exec. The replacement process calls
+    /// `enable_raw_mode` and treats whatever termios it sees as the
+    /// "original" cooked mode — if we exec while still raw, quit later
+    /// restores to raw and the parent shell loses echo.
+    fn reload(&mut self) {
+        let exe = release_binary_path()
+            .filter(|p| p.exists())
+            .or_else(|| std::env::current_exe().ok());
+        let Some(exe) = exe else {
+            self.notice("reload failed: could not locate the m binary");
+            self.dirty = true;
+            return;
+        };
+        let kitty = self.kitty;
+        restore_terminal(kitty);
+        use std::os::unix::process::CommandExt;
+        let err = std::process::Command::new(&exe)
+            .arg("-C")
+            .arg(&self.cwd)
+            .arg("-m")
+            .arg(&self.profile_name)
+            .arg("--session")
+            .arg(&self.session_path)
+            .exec();
+        // exec failed — get the TUI back so the user can keep working.
+        if let Err(e) = enter_terminal(kitty) {
+            self.notice(format!(
+                "reload failed to exec {} ({err}); also re-enter TUI: {e}",
+                exe.display()
+            ));
+        } else {
+            self.notice(format!("reload failed to exec {}: {err}", exe.display()));
+        }
+        self.dirty = true;
+    }
+
+    /// `cargo build --release` then `cargo test --release` in `self.cwd`,
+    /// off the UI thread — a build that compiles but fails its own tests
+    /// never gets hot-loaded over a working session. Both commands' own
+    /// stdout/stderr are captured (not inherited) so they don't corrupt the
+    /// alternate screen. `apply()` schedules a `reload()` once
+    /// `UiMsg::RebuildDone(Ok(()))` comes back.
+    fn spawn_rebuild(&mut self) {
+        self.notice("rebuilding in the background (cargo build --release)…");
+        let cwd = self.cwd.clone();
+        let tx = self.ui_tx.clone();
+        std::thread::spawn(move || {
+            let msg = run_cargo_step(&cwd, &["build", "--release"], "build")
+                .and_then(|()| run_cargo_step(&cwd, &["test", "--release"], "tests"));
+            tx.send(UiMsg::RebuildDone(msg)).ok();
+        });
     }
 
     fn toggle_last(&mut self, pred: impl Fn(&CellKind) -> bool) {
@@ -839,6 +1371,52 @@ impl App {
             }
         }
         out
+    }
+
+    /// Refresh the project file listing in the background; called on every
+    /// literal `@` keystroke rather than per filter-keystroke, since
+    /// filtering itself is a pure in-memory pass over `at_files`.
+    fn spawn_at_listing(&mut self) {
+        self.at_loading = true;
+        let cwd = self.cwd.clone();
+        let tx = self.ui_tx.clone();
+        std::thread::spawn(move || {
+            tx.send(UiMsg::AtFiles(files::list_project_files(&cwd)))
+                .ok();
+        });
+    }
+
+    /// Whether the `@`-mention popup should be showing right now.
+    fn at_open(&self) -> bool {
+        matches!(self.editor.mention(), Some((start, _)) if self.at_dismissed_at != Some(start))
+    }
+
+    fn at_matches(&self) -> Vec<(String, i64)> {
+        let Some((_, query)) = self.editor.mention() else {
+            return Vec::new();
+        };
+        let mut out: Vec<(String, i64)> = self
+            .at_files
+            .iter()
+            .filter_map(|f| fuzzy::score(f, query).map(|s| (f.clone(), s)))
+            .collect();
+        out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.len().cmp(&b.0.len())));
+        out.truncate(20);
+        out
+    }
+
+    /// Insert the selected match as `@relative/path ` (trailing space).
+    /// That trailing space naturally closes the popup on the next frame —
+    /// `Editor::mention` sees whitespace in the query and returns `None` —
+    /// so there's no separate "close" step needed.
+    fn at_complete(&mut self) {
+        let Some((start, _)) = self.editor.mention() else {
+            return;
+        };
+        let matches = self.at_matches();
+        if let Some((path, _)) = matches.get(self.at_sel.min(matches.len().saturating_sub(1))) {
+            self.editor.complete_mention(start, &format!("@{path} "));
+        }
     }
 
     fn slash_complete(&mut self) {
@@ -909,7 +1487,9 @@ impl App {
                 self.notice(
                     "enter send · shift/alt+enter newline · esc cancel · ctrl+c ×2 quit · \
                      ctrl+o expand tool · ctrl+t expand thinking · ctrl+r sessions · \
-                     pgup/pgdn or wheel scroll · /new /resume /compact /quit",
+                     ctrl+x ctrl+e edit in $EDITOR · @ file picker · \
+                     pgup/pgdn or wheel scroll · \
+                     /new /resume /compact /model <provider>/<model> /reload /rebuild /quit",
                 );
             }
             "/quit" => self.quit = true,
@@ -936,6 +1516,46 @@ impl App {
                     "{sys_skills} skills discovered (see system prompt index); \
                      {cmds} user slash commands"
                 ));
+            }
+            "/model" => {
+                if args.is_empty() {
+                    let current = self.profile_label.clone();
+                    let list = m_core::config::list_selections()
+                        .into_iter()
+                        .map(|(p, m)| {
+                            let label = format!("{p}/{m}");
+                            if label == current {
+                                format!("{label} (current)")
+                            } else {
+                                label
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    self.notice(format!(
+                        "models: {list} — /model <provider>/<model> or /model <provider> <model>"
+                    ));
+                } else if self.running {
+                    self.notice("busy — esc to cancel first");
+                } else {
+                    self.cmd_tx
+                        .send(AgentCmd::SwitchProfile(args.to_string()))
+                        .ok();
+                }
+            }
+            "/reload" => {
+                if self.running {
+                    self.notice("busy — esc to cancel first");
+                } else {
+                    self.reload();
+                }
+            }
+            "/rebuild" => {
+                if self.running {
+                    self.notice("busy — esc to cancel first");
+                } else {
+                    self.spawn_rebuild();
+                }
             }
             other => self.notice(format!("unknown command: {other}")),
         }
@@ -983,7 +1603,9 @@ impl App {
         self.draw_transcript(f, transcript_area);
         self.draw_input(f, input_area);
         self.draw_status(f, status_area);
-        if self.slash_active() {
+        if self.at_open() {
+            self.draw_at_menu(f, input_area);
+        } else if self.slash_active() {
             self.draw_slash_menu(f, input_area);
         }
         if self.picker.is_some() {
@@ -1042,10 +1664,16 @@ impl App {
         } else {
             theme::accent()
         };
-        let block = Block::default()
+        let mut block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(border_style);
+        if self.leader_x.is_some() {
+            block = block.title(Span::styled(
+                " ctrl+x ctrl+e: edit in $EDITOR ",
+                theme::dim(),
+            ));
+        }
         let inner = block.inner(area);
         f.render_widget(block, area);
         let text: Vec<Line> = self
@@ -1154,6 +1782,50 @@ impl App {
         );
     }
 
+    fn draw_at_menu(&mut self, f: &mut Frame, input_area: Rect) {
+        let matches = self.at_matches();
+        self.at_sel = self.at_sel.min(matches.len().saturating_sub(1));
+        let loading = self.at_loading && self.at_files.is_empty();
+        let h = matches.len().max(1) as u16 + 2;
+        let area = Rect {
+            x: input_area.x + 2,
+            y: input_area.y.saturating_sub(h),
+            width: 60.min(f.area().width.saturating_sub(4)),
+            height: h,
+        };
+        let lines: Vec<Line> = if matches.is_empty() {
+            let msg = if loading {
+                "loading files…"
+            } else {
+                "no matches"
+            };
+            vec![Line::styled(format!(" {msg}"), theme::dim())]
+        } else {
+            matches
+                .iter()
+                .enumerate()
+                .map(|(i, (path, _))| {
+                    let style = if i == self.at_sel {
+                        theme::accent().reversed()
+                    } else {
+                        Style::default()
+                    };
+                    Line::styled(format!(" {path}"), style)
+                })
+                .collect()
+        };
+        f.render_widget(Clear, area);
+        f.render_widget(
+            Paragraph::new(lines).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(theme::dim()),
+            ),
+            area,
+        );
+    }
+
     fn draw_picker(&mut self, f: &mut Frame) {
         let Some(p) = &self.picker else { return };
         let w = (f.area().width * 3 / 4).clamp(30, 100);
@@ -1201,6 +1873,32 @@ impl App {
     }
 }
 
+/// Outcome of feeding a keypress through the emacs-style `ctrl+x` leader
+/// prefix used to open the input in `$EDITOR` (`ctrl+x ctrl+e`, mirroring
+/// bash readline's edit-and-execute-command).
+#[derive(Debug, PartialEq, Eq)]
+enum LeaderOutcome {
+    /// No leader sequence involved; caller handles the key as usual.
+    Pass,
+    /// `ctrl+x` seen; now waiting for the completing key.
+    Armed,
+    /// `ctrl+x` followed by `e`/`E` within the timeout: open the editor.
+    OpenEditor,
+}
+
+fn leader_step(pending: bool, ctrl: bool, code: KeyCode) -> LeaderOutcome {
+    if pending {
+        return match code {
+            KeyCode::Char('e') | KeyCode::Char('E') => LeaderOutcome::OpenEditor,
+            _ => LeaderOutcome::Pass,
+        };
+    }
+    if ctrl && matches!(code, KeyCode::Char('x')) {
+        return LeaderOutcome::Armed;
+    }
+    LeaderOutcome::Pass
+}
+
 fn ago(secs: u64) -> String {
     match secs {
         0..=59 => format!("{secs}s ago"),
@@ -1236,4 +1934,61 @@ fn telemetry_of(
         }
     }
     t
+}
+
+#[cfg(test)]
+mod leader_tests {
+    use super::*;
+
+    #[test]
+    fn ctrl_x_arms_the_leader() {
+        assert_eq!(
+            leader_step(false, true, KeyCode::Char('x')),
+            LeaderOutcome::Armed
+        );
+    }
+
+    #[test]
+    fn plain_x_does_not_arm() {
+        assert_eq!(
+            leader_step(false, false, KeyCode::Char('x')),
+            LeaderOutcome::Pass
+        );
+    }
+
+    #[test]
+    fn e_after_leader_opens_editor_ctrl_or_not() {
+        assert_eq!(
+            leader_step(true, false, KeyCode::Char('e')),
+            LeaderOutcome::OpenEditor
+        );
+        assert_eq!(
+            leader_step(true, true, KeyCode::Char('e')),
+            LeaderOutcome::OpenEditor
+        );
+        assert_eq!(
+            leader_step(true, false, KeyCode::Char('E')),
+            LeaderOutcome::OpenEditor
+        );
+    }
+
+    #[test]
+    fn other_key_after_leader_passes_through_instead_of_opening() {
+        assert_eq!(
+            leader_step(true, false, KeyCode::Char('q')),
+            LeaderOutcome::Pass
+        );
+        assert_eq!(
+            leader_step(true, true, KeyCode::Char('c')),
+            LeaderOutcome::Pass
+        );
+    }
+
+    #[test]
+    fn second_ctrl_x_while_not_pending_rearms() {
+        assert_eq!(
+            leader_step(false, true, KeyCode::Char('x')),
+            LeaderOutcome::Armed
+        );
+    }
 }
