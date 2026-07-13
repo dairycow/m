@@ -9,6 +9,7 @@ mod input;
 mod md;
 mod theme;
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -222,7 +223,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/resume", "pick a previous session"),
     ("/compact", "summarize the session to free context"),
     ("/skills", "list discovered skills"),
-    ("/model", "list or switch configured provider profiles"),
+    ("/model", "list or switch provider/model (e.g. zai-coding-plan/glm-5.2)"),
     ("/reload", "hot-reload the running binary, keeping this session"),
     ("/rebuild", "cargo build+test --release in the background, then hot-reload"),
     ("/quit", "exit m"),
@@ -280,6 +281,8 @@ pub struct App {
     /// Byte offset of an `@` the user Esc'd; keeps that mention's popup
     /// closed until it's retyped.
     at_dismissed_at: Option<usize>,
+    /// Kitty keyboard-enhancement protocol active (for restore /reload).
+    kitty: bool,
 }
 
 pub fn run_tui(
@@ -340,6 +343,7 @@ pub fn run_tui(
         at_loading: false,
         at_sel: 0,
         at_dismissed_at: None,
+        kitty: false, // set once enhancement probe completes
     };
     if app.cells.is_empty() {
         app.cells.push(Cell::new(CellKind::Notice(format!(
@@ -351,8 +355,21 @@ pub fn run_tui(
 
     spawn_agent_thread(agent, cmd_rx, ui_tx);
 
-    // Terminal setup with restore-on-panic.
+    // Snapshot cooked termios *before* raw mode so signal handlers can put
+    // the shell back even when Drop/panic hooks don't run (SIGTERM, etc.).
+    // Without this, a killed TUI leaves the tty with ECHO/ICANON off — the
+    // classic "commands work but typed text is invisible" failure mode.
+    save_cooked_termios();
+
+    // Terminal setup. `TerminalGuard` restores on every exit path (Ok, Err,
+    // panic); signal handlers cover hard kills that skip unwinding.
+    //
+    // Install emergency signal handlers *before* the kitty probe: that
+    // query blocks up to ~2s, and a SIGTERM in the window used to leave
+    // the shell raw with no restore path.
     crossterm::terminal::enable_raw_mode()?;
+    install_emergency_signal_handlers();
+    mark_tui_active(false);
     let mut out = std::io::stdout();
     crossterm::execute!(
         out,
@@ -368,11 +385,10 @@ pub fn run_tui(
             )
         )?;
     }
-    let default_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        restore_terminal(kitty);
-        default_hook(info);
-    }));
+    mark_tui_active(kitty);
+    install_panic_hook(kitty);
+    app.kitty = kitty;
+    let mut guard = TerminalGuard { kitty, armed: true };
 
     let mut terminal = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
     // A fresh Terminal's diff buffer starts blank, so it may skip cells it
@@ -387,7 +403,7 @@ pub fn run_tui(
         first_frame = Some((t0.elapsed(), rss_kb()));
     }
     let res = app.event_loop(&mut terminal, kitty);
-    restore_terminal(kitty);
+    guard.restore();
     if let Some((ttff, rss)) = first_frame {
         eprintln!(
             "m: first frame {:.1}ms · rss {:.1}MB",
@@ -410,18 +426,222 @@ fn rss_kb() -> u64 {
         .unwrap_or(0)
 }
 
-fn restore_terminal(kitty: bool) {
-    let mut out = std::io::stdout();
-    if kitty {
-        crossterm::execute!(out, event::PopKeyboardEnhancementFlags).ok();
+// ---------------------------------------------------------------- terminal lifecycle
+//
+// Leaving raw mode / alternate screen is the difference between a usable
+// shell and one that accepts keystrokes but paints nothing (ECHO off).
+// Restore is therefore best-effort, idempotent, and reachable from Drop,
+// the panic hook, signal handlers, and the `/reload` exec path.
+
+/// TUI currently owns the tty (raw + alt screen). Cleared by restore.
+static TUI_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Kitty keyboard progressive-enhancement stack was pushed.
+static KITTY_PUSHED: AtomicBool = AtomicBool::new(false);
+/// `SAVED_TERMIOS` holds a pre-raw snapshot suitable for signal-safe restore.
+static TERMIOS_SAVED: AtomicBool = AtomicBool::new(false);
+
+// Written once on the main thread before signals are installed; read from
+// signal handlers afterwards. Access is synchronized by TERMIOS_SAVED + the
+// single-threaded install-before-use pattern.
+static mut SAVED_TERMIOS: libc::termios = unsafe { std::mem::zeroed() };
+
+fn save_cooked_termios() {
+    unsafe {
+        let mut t: libc::termios = std::mem::zeroed();
+        // stdin is the controlling tty in interactive use; match crossterm.
+        if libc::tcgetattr(libc::STDIN_FILENO, &mut t) == 0 {
+            // If we were re-exec'd without a prior restore (or started under
+            // another raw-mode program), the snapshot is already raw. Treat
+            // that as unusable and force a sane cooked baseline so quit can
+            // never "restore" to invisible-echo mode.
+            ensure_cooked_flags(&mut t);
+            SAVED_TERMIOS = t;
+            TERMIOS_SAVED.store(true, Ordering::SeqCst);
+        }
     }
+}
+
+/// Turn on the line-discipline flags an interactive shell needs. Idempotent
+/// on an already-cooked termios; repairs a raw one into something usable.
+fn ensure_cooked_flags(t: &mut libc::termios) {
+    // Input: map CR→NL, allow XON/XOFF; drop raw-style stripping.
+    t.c_iflag |= libc::BRKINT | libc::ICRNL | libc::IMAXBEL | libc::IXON;
+    t.c_iflag &= !(libc::IGNBRK | libc::INLCR | libc::IGNCR | libc::IXOFF);
+    // Output: post-process NL→CRNL so shell output is visible line-by-line.
+    t.c_oflag |= libc::OPOST | libc::ONLCR;
+    // Local: canonical line editing + echo + signals. This is the whole fix
+    // for "commands work but typed text is invisible".
+    t.c_lflag |= libc::ISIG | libc::ICANON | libc::IEXTEN | libc::ECHO | libc::ECHOE | libc::ECHOK;
+    t.c_lflag &= !(libc::ECHONL);
+    // Non-canonical VMIN/VTIME are irrelevant once ICANON is on, but leave
+    // cc[] as whatever the host had so erase/kill chars stay familiar.
+}
+
+fn mark_tui_active(kitty: bool) {
+    TUI_ACTIVE.store(true, Ordering::SeqCst);
+    KITTY_PUSHED.store(kitty, Ordering::SeqCst);
+}
+
+/// RAII: always put the terminal back when the TUI scope ends.
+struct TerminalGuard {
+    kitty: bool,
+    armed: bool,
+}
+
+impl TerminalGuard {
+    /// Restore now and disarm so Drop is a no-op (e.g. before `exec`).
+    fn restore(&mut self) {
+        if self.armed {
+            restore_terminal(self.kitty);
+            self.armed = false;
+        }
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            restore_terminal(self.kitty);
+            self.armed = false;
+        }
+    }
+}
+
+fn install_panic_hook(kitty: bool) {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore_terminal(kitty);
+        default_hook(info);
+    }));
+}
+
+fn install_emergency_signal_handlers() {
+    // SIGINT is normally masked by raw mode (ISIG off) for in-band ctrl+c
+    // handling, but external `kill -INT` / SIGHUP / SIGTERM / SIGQUIT still
+    // arrive and would otherwise exit without restoring the tty.
+    unsafe {
+        let f: extern "C" fn(libc::c_int) = emergency_terminal_restore;
+        let handler = f as usize;
+        libc::signal(libc::SIGTERM, handler);
+        libc::signal(libc::SIGHUP, handler);
+        libc::signal(libc::SIGINT, handler);
+        libc::signal(libc::SIGQUIT, handler);
+    }
+}
+
+/// Async-signal-safe-ish emergency restore. Uses only `write` + `tcsetattr`
+/// + `_exit` — not crossterm (locks / alloc).
+extern "C" fn emergency_terminal_restore(sig: libc::c_int) {
+    // Always try; TUI_ACTIVE just avoids a second pass if Drop already ran.
+    TUI_ACTIVE.store(false, Ordering::SeqCst);
+    // CSI sequences: pop kitty kbd, disable mouse (all modes crossterm enables),
+    // leave alt screen, show cursor, reset SGR, reset scroll region.
+    // PopKeyboardEnhancementFlags == CSI < 1 u
+    const SEQ: &[u8] = b"\x1b[<1u\x1b[?1006l\x1b[?1015l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?1049l\x1b[?25h\x1b[0m\x1b[r";
+    unsafe {
+        libc::write(libc::STDOUT_FILENO, SEQ.as_ptr() as *const _, SEQ.len());
+        // Background jobs get SIGTTOU on tcsetattr to the controlling tty;
+        // ignore it so the restore still lands.
+        libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+        // Prefer /dev/tty when present: stdin may be a pipe in odd launchers,
+        // while the line discipline we raw'd lives on the controlling tty.
+        let mut fd = libc::STDIN_FILENO;
+        let tty = libc::open(c"/dev/tty".as_ptr(), libc::O_RDWR | libc::O_NOCTTY);
+        if tty >= 0 {
+            fd = tty;
+        }
+        if TERMIOS_SAVED.load(Ordering::SeqCst) {
+            let rc = libc::tcsetattr(fd, libc::TCSANOW, std::ptr::addr_of!(SAVED_TERMIOS));
+            if rc != 0 {
+                // Snapshot missing or rejected — synthesize cooked flags on the live attrs.
+                let mut t: libc::termios = std::mem::zeroed();
+                if libc::tcgetattr(fd, &mut t) == 0 {
+                    // Inline the critical bits (no call into non-async-safe code).
+                    t.c_iflag |= libc::BRKINT | libc::ICRNL | libc::IMAXBEL | libc::IXON;
+                    t.c_oflag |= libc::OPOST | libc::ONLCR;
+                    t.c_lflag |= libc::ISIG
+                        | libc::ICANON
+                        | libc::IEXTEN
+                        | libc::ECHO
+                        | libc::ECHOE
+                        | libc::ECHOK;
+                    libc::tcsetattr(fd, libc::TCSANOW, &t);
+                }
+            }
+        } else {
+            let mut t: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(fd, &mut t) == 0 {
+                t.c_iflag |= libc::BRKINT | libc::ICRNL | libc::IMAXBEL | libc::IXON;
+                t.c_oflag |= libc::OPOST | libc::ONLCR;
+                t.c_lflag |= libc::ISIG
+                    | libc::ICANON
+                    | libc::IEXTEN
+                    | libc::ECHO
+                    | libc::ECHOE
+                    | libc::ECHOK;
+                libc::tcsetattr(fd, libc::TCSANOW, &t);
+            }
+        }
+        if tty >= 0 {
+            libc::close(tty);
+        }
+        libc::_exit(128 + sig);
+    }
+}
+
+fn restore_terminal(kitty: bool) {
+    TUI_ACTIVE.store(false, Ordering::SeqCst);
+    let mut out = std::io::stdout();
+    let pop_kitty = kitty || KITTY_PUSHED.load(Ordering::SeqCst);
+    if pop_kitty {
+        crossterm::execute!(out, event::PopKeyboardEnhancementFlags).ok();
+        KITTY_PUSHED.store(false, Ordering::SeqCst);
+    }
+    // Show cursor + reset colors: ratatui may have left the cursor hidden or
+    // an SGR attribute active if we tear down mid-frame.
     crossterm::execute!(
         out,
         event::DisableMouseCapture,
-        crossterm::terminal::LeaveAlternateScreen
+        crossterm::terminal::LeaveAlternateScreen,
+        crossterm::cursor::Show,
+        crossterm::style::ResetColor,
     )
     .ok();
+    // Reset scrolling region (DECSTBM) in case a partial draw left it set.
+    let _ = out.write_all(b"\x1b[r");
+    let _ = out.flush();
     crossterm::terminal::disable_raw_mode().ok();
+    // Final authority: apply our pre-raw snapshot (with cooked flags forced
+    // on). Crossterm alone is not enough after `/reload` exec, because the
+    // replacement process would have saved raw mode as its "original".
+    force_cooked_termios();
+}
+
+fn force_cooked_termios() {
+    unsafe {
+        libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+        // Prefer the controlling tty over stdin: they diverge when stdin is
+        // redirected, and background restores need /dev/tty to avoid SIGTTOU
+        // weirdness with the process-group line discipline.
+        let tty = libc::open(c"/dev/tty".as_ptr(), libc::O_RDWR | libc::O_NOCTTY);
+        let fd = if tty >= 0 { tty } else { libc::STDIN_FILENO };
+
+        let ok = if TERMIOS_SAVED.load(Ordering::SeqCst) {
+            libc::tcsetattr(fd, libc::TCSANOW, std::ptr::addr_of!(SAVED_TERMIOS)) == 0
+        } else {
+            false
+        };
+        if !ok {
+            let mut t: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(fd, &mut t) == 0 {
+                ensure_cooked_flags(&mut t);
+                let _ = libc::tcsetattr(fd, libc::TCSANOW, &t);
+            }
+        }
+        if tty >= 0 {
+            libc::close(tty);
+        }
+    }
 }
 
 /// Re-enter the TUI's raw/alternate-screen mode after [`restore_terminal`]
@@ -442,6 +662,7 @@ fn enter_terminal(kitty: bool) -> std::io::Result<()> {
             )
         )?;
     }
+    mark_tui_active(kitty);
     Ok(())
 }
 
@@ -738,9 +959,14 @@ impl App {
             }
             UiMsg::RebuildDone(Err(e)) => self.notice(format!("rebuild failed: {e}")),
             UiMsg::ProfileSwitched { name, model } => {
-                self.profile_label = format!("{name}/{model}");
-                self.notice(format!("switched to profile '{name}' ({model})"));
-                self.profile_name = name;
+                let label = format!("{name}/{model}");
+                if self.profile_label == label {
+                    self.notice(format!("already on {label}"));
+                } else {
+                    self.profile_label = label.clone();
+                    self.profile_name = name;
+                    self.notice(format!("switched to {label}"));
+                }
             }
             UiMsg::AtFiles(files) => {
                 self.at_files = files.into();
@@ -1036,6 +1262,11 @@ impl App {
     /// reports it as `<path> (deleted)` and exec fails. `release_binary_path`
     /// is a plain path computed from the workspace this copy was built
     /// from, so the exec looks up whatever is *currently* linked there.
+    ///
+    /// Restores the tty *before* exec. The replacement process calls
+    /// `enable_raw_mode` and treats whatever termios it sees as the
+    /// "original" cooked mode — if we exec while still raw, quit later
+    /// restores to raw and the parent shell loses echo.
     fn reload(&mut self) {
         let exe = release_binary_path()
             .filter(|p| p.exists())
@@ -1045,6 +1276,8 @@ impl App {
             self.dirty = true;
             return;
         };
+        let kitty = self.kitty;
+        restore_terminal(kitty);
         use std::os::unix::process::CommandExt;
         let err = std::process::Command::new(&exe)
             .arg("-C")
@@ -1054,7 +1287,15 @@ impl App {
             .arg("--session")
             .arg(&self.session_path)
             .exec();
-        self.notice(format!("reload failed to exec {}: {err}", exe.display()));
+        // exec failed — get the TUI back so the user can keep working.
+        if let Err(e) = enter_terminal(kitty) {
+            self.notice(format!(
+                "reload failed to exec {} ({err}); also re-enter TUI: {e}",
+                exe.display()
+            ));
+        } else {
+            self.notice(format!("reload failed to exec {}: {err}", exe.display()));
+        }
         self.dirty = true;
     }
 
@@ -1222,7 +1463,7 @@ impl App {
                      ctrl+o expand tool · ctrl+t expand thinking · ctrl+r sessions · \
                      ctrl+x ctrl+e edit in $EDITOR · @ file picker · \
                      pgup/pgdn or wheel scroll · \
-                     /new /resume /compact /model /reload /rebuild /quit",
+                     /new /resume /compact /model <provider>/<model> /reload /rebuild /quit",
                 );
             }
             "/quit" => self.quit = true,
@@ -1252,16 +1493,22 @@ impl App {
             }
             "/model" => {
                 if args.is_empty() {
-                    let list = m_core::config::profile_names()
+                    let current = self.profile_label.clone();
+                    let list = m_core::config::list_selections()
                         .into_iter()
-                        .map(|n| {
-                            if n == self.profile_name { format!("{n} (current)") } else { n }
+                        .map(|(p, m)| {
+                            let label = format!("{p}/{m}");
+                            if label == current {
+                                format!("{label} (current)")
+                            } else {
+                                label
+                            }
                         })
                         .collect::<Vec<_>>()
                         .join(", ");
-                    self.notice(format!("profiles: {list} — /model <name> to switch"));
-                } else if args == self.profile_name {
-                    self.notice(format!("already on '{args}'"));
+                    self.notice(format!(
+                        "models: {list} — /model <provider>/<model> or /model <provider> <model>"
+                    ));
                 } else if self.running {
                     self.notice("busy — esc to cancel first");
                 } else {

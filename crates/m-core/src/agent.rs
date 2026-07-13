@@ -166,15 +166,29 @@ impl Agent {
         Ok(())
     }
 
-    /// Switch to a different provider profile from config.toml, keeping the
+    /// Switch provider and/or model from a `/model` spec, keeping the
     /// session, cwd, and system prompt untouched. Re-probes the context
-    /// window for the new endpoint in the background.
-    pub fn switch_profile(&mut self, name: &str) -> Result<()> {
-        let new_cfg = crate::config::load(Some(name))?;
+    /// window when the provider endpoint changes.
+    ///
+    /// Spec forms: `provider`, `provider/model`, `provider model`, or a bare
+    /// model id (resolved against the current provider, then the catalog).
+    pub fn switch_profile(&mut self, spec: &str) -> Result<()> {
+        let (name, model) = crate::config::resolve_model_spec(
+            spec,
+            &self.config.profile_name,
+            &self.config.profile.model,
+        )?;
+        let endpoint_changed = name != self.config.profile_name;
+        // Load provider defaults, then pin the resolved model (which may
+        // differ from the profile's default).
+        let mut new_cfg = crate::config::load(Some(&name))?;
+        new_cfg.profile.model = model;
         self.config.profile_name = new_cfg.profile_name;
         self.config.profile = new_cfg.profile;
         self.ctx_limit.store(self.config.profile.ctx, Ordering::Relaxed);
-        spawn_ctx_probe(&self.ctx_limit, &self.config.profile);
+        if endpoint_changed {
+            spawn_ctx_probe(&self.ctx_limit, &self.config.profile);
+        }
         Ok(())
     }
 
