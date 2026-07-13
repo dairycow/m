@@ -92,9 +92,34 @@ base_url = "https://openrouter.ai/api/v1"
 api_key = "sk-or-..."
 model = "qwen/qwen3-coder"
 temperature = 0.2      # optional; omitted = server default
-```
 
-Select with `m -m or` or `M_PROFILE=or`.
+[profiles.zai-coding-plan]
+base_url = "https://api.z.ai/api/coding/paas/v4"
+api_key = "REPLACE_WITH_YOUR_KEY"
+model = "glm-5.2"             # default
+models = ["glm-5.2", "glm-5-turbo", "glm-4.7", "glm-4.5-air"]
+
+# xAI developer API (console.x.ai credits, OpenAI-compatible)
+[profiles.xai]
+base_url = "https://api.x.ai/v1"
+api_key = "xai-..."           # or api_key = "$XAI_API_KEY"
+model = "grok-4.5"
+models = ["grok-4.5", "grok-4.3"]
+
+# SuperGrok / X Premium+ via Grok Build CLI proxy (uses `grok login` session)
+[profiles.grok]
+base_url = "https://cli-chat-proxy.grok.com/v1"
+model = "grok-build"
+models = ["grok-build"]
+api_key_cmd = "jq -r 'to_entries[0].value.key' \"$HOME/.grok/auth.json\""
+[profiles.grok.headers]
+X-XAI-Token-Auth = "xai-grok-cli"
+x-grok-client-version = "0.2.99"
+x-grok-client-identifier = "xai-grok-cli"
+x-grok-model-override = "grok-build"   # kept in sync with `model` at request time
+
+Select with `m -m grok`, `m -m zai-coding-plan/glm-5-turbo`, or in the TUI:
+`/model`, `/model zai-coding-plan/glm-5.2`, `/model grok`.
 
 ## Extensibility (all files, no plugins)
 

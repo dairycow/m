@@ -32,7 +32,7 @@ Usage:
 Options:
   -p, --print [PROMPT]   headless mode
       --json             with -p: emit events as JSON lines
-  -m, --profile NAME     provider profile from ~/.config/m/config.toml
+  -m, --profile SPEC     provider or provider/model from ~/.config/m/config.toml
   -r, --resume           continue the most recent session in this directory
       --session PATH     resume a specific session file
   -C, --dir PATH         working directory for the agent
